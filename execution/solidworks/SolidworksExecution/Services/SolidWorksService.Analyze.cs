@@ -1323,6 +1323,13 @@ namespace SolidworksExecution.Services
                 var surf = face.IGetSurface();
                 bool planar = surf != null && surf.IsPlane();
                 fj["planar"] = planar;
+                // Phase 1 (STEP -> features): `kind` on EVERY face and the face-vs-surface sense, so a
+                // recognizer can tell a hole (concave cylinder) from a boss without extra calls.
+                // `reversed` = the face's outward normal is OPPOSITE the underlying surface's own
+                // normal (IFace2.FaceInRespectToSurface false-ness is inverted here deliberately:
+                // FaceInRespectToSurface() == true means "same sense"). Additive fields only.
+                if (planar) fj["kind"] = "plane";
+                try { fj["reversed"] = !face.FaceInRespectToSurface(); } catch { }
                 try { fj["area"] = R6(face.GetArea()); } catch { }
                 if (planar)
                 {
@@ -1361,8 +1368,45 @@ namespace SolidworksExecution.Services
                                 fj["radius"] = R6(cp2[6]);
                             }
                         }
-                        else if (surf.IsCone()) fj["kind"] = "cone";
-                        else if (surf.IsSphere()) fj["kind"] = "sphere";
+                        else if (surf.IsCone())
+                        {
+                            fj["kind"] = "cone";
+                            // ConeParams: [0..2]=origin (apex-side), [3..5]=axis, [6]=radius at origin,
+                            // [7]=half angle (rad).
+                            var kp = ToDoubles(surf.ConeParams);
+                            if (kp != null && kp.Length >= 8)
+                            {
+                                fj["origin"] = new JArray { R6(kp[0]), R6(kp[1]), R6(kp[2]) };
+                                fj["axis"] = new JArray { R6(kp[3]), R6(kp[4]), R6(kp[5]) };
+                                fj["radius"] = R6(kp[6]);
+                                fj["half_angle"] = R6(kp[7]);
+                            }
+                        }
+                        else if (surf.IsSphere())
+                        {
+                            fj["kind"] = "sphere";
+                            // SphereParams: [0..2]=center, [3]=radius.
+                            var sp = ToDoubles(surf.SphereParams);
+                            if (sp != null && sp.Length >= 4)
+                            {
+                                fj["origin"] = new JArray { R6(sp[0]), R6(sp[1]), R6(sp[2]) };
+                                fj["radius"] = R6(sp[3]);
+                            }
+                        }
+                        else if (surf.IsTorus())
+                        {
+                            fj["kind"] = "torus";
+                            // TorusParams: [0..2]=center, [3..5]=axis, [6]=major radius, [7]=minor radius.
+                            var tp = ToDoubles(surf.TorusParams);
+                            if (tp != null && tp.Length >= 8)
+                            {
+                                fj["origin"] = new JArray { R6(tp[0]), R6(tp[1]), R6(tp[2]) };
+                                fj["axis"] = new JArray { R6(tp[3]), R6(tp[4]), R6(tp[5]) };
+                                fj["major_radius"] = R6(tp[6]);
+                                fj["minor_radius"] = R6(tp[7]);
+                            }
+                        }
+                        else fj["kind"] = "other";   // B-spline / swept / revolved freeform: no closed form
                         var uv2 = face.GetUVBounds() as double[];
                         if (uv2 != null && uv2.Length >= 4)
                         {
@@ -1376,6 +1420,18 @@ namespace SolidworksExecution.Services
             }
             catch { }
             return fj;
+        }
+
+        // COM returns a double[] or an object[] of boxed doubles depending on the interop path
+        // (see the CylinderParams handling above) — normalize both.
+        private static double[] ToDoubles(object raw)
+        {
+            if (raw is double[] d) return d;
+            if (raw is object[] o)
+            {
+                try { return Array.ConvertAll(o, x => Convert.ToDouble(x)); } catch { return null; }
+            }
+            return null;
         }
 
         private JObject ReadEdges(IPartDoc partDoc, double[] near = null, int k = 0, double[] axis = null)

@@ -33,32 +33,48 @@ import math
 from .errors import FeatureError
 
 _UP = (0.0, 1.0, 0.0)   # SolidWorks default "up" axis (+Y). v0-exp binds 'top' to global +Y.
+# Semantic face selector -> outward world direction. 'top' keeps its v0 meaning (+Y); the other
+# five follow the same convention as the datum planes (front plane normal = +Z, right = +X).
+FACE_DIRECTIONS = {
+    "top": (0.0, 1.0, 0.0), "bottom": (0.0, -1.0, 0.0),
+    "front": (0.0, 0.0, 1.0), "back": (0.0, 0.0, -1.0),
+    "right": (1.0, 0.0, 0.0), "left": (-1.0, 0.0, 0.0),
+}
 _NORMAL_TOL = 0.9       # a face counts as "upward" when normal . up >= this
 _TIE_EPS = 1e-6         # two upward faces this close in height => ambiguous
 _PLANE_TOL = 1e-5       # anchor->plane distance for a face-anchor match (10x the 1µm grid)
 _EDGE_TOL = 1e-4        # anchor->mid distance ball for an edge-anchor match (0.1 mm)
 
 
-def resolve_top_face(port, state_version, node_id=None):
-    """Return (face_index, info) for the semantic 'top' face. Raises FeatureError on
-    REFERENCE_UNRESOLVED (no upward face / analyze failed) or REFERENCE_AMBIGUOUS (a tie)."""
+def resolve_face(port, state_version, selector="top", node_id=None):
+    """Return (face_index, info) for a semantic planar-face selector (top/bottom/front/back/
+    right/left). Among PLANAR faces whose normal points along the selector's direction
+    (dot >= _NORMAL_TOL), the one furthest along that direction wins. Raises FeatureError on
+    REFERENCE_UNRESOLVED (unknown selector / no such face / analyze failed) or
+    REFERENCE_AMBIGUOUS (a tie at the extreme)."""
+    step = "resolve_%s_face" % selector
+    direction = FACE_DIRECTIONS.get(selector)
+    if direction is None:
+        raise FeatureError("unknown face selector %r (supported: %s)"
+                           % (selector, sorted(FACE_DIRECTIONS)),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
     resp = port.execute("analyze_model", {"analysis_type": "faces", "name": ""}, state_version)
     if resp.get("status") != "COMPLETED":
         err = resp.get("error") or {}
         raise FeatureError("analyze_model(faces) failed: %s" % err.get("message"),
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
 
     feats = (resp.get("cadState") or {}).get("features") or []
     if not feats:
         raise FeatureError("analyze_model(faces) returned no face data (is there a solid body?)",
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
     try:
         data = json.loads(feats[0])
     except Exception as ex:
         raise FeatureError("could not parse analyze_model(faces) payload: %s" % ex,
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
 
-    candidates = []  # (centroid_y, face_index, face)
+    candidates = []  # (extent along direction, face_index, face)
     for f in data.get("faces") or []:
         if not f.get("planar"):
             continue
@@ -66,24 +82,36 @@ def resolve_top_face(port, state_version, node_id=None):
         p = f.get("point")
         if not (isinstance(n, list) and isinstance(p, list) and len(n) >= 3 and len(p) >= 3):
             continue
-        dot = n[0] * _UP[0] + n[1] * _UP[1] + n[2] * _UP[2]
+        dot = n[0] * direction[0] + n[1] * direction[1] + n[2] * direction[2]
         if dot >= _NORMAL_TOL:
-            candidates.append((p[1], int(f.get("i", -1)), f))
+            extent = p[0] * direction[0] + p[1] * direction[1] + p[2] * direction[2]
+            candidates.append((extent, int(f.get("i", -1)), f))
 
     if not candidates:
-        raise FeatureError("no upward-facing planar face found — a 'top face' could not be resolved",
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
+        raise FeatureError("no %s-facing planar face found — a '%s face' could not be resolved"
+                           % (selector, selector),
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
 
     candidates.sort(key=lambda c: c[0], reverse=True)
-    top_y, top_i, top_face = candidates[0]
-    if top_i < 0:
-        raise FeatureError("resolved top face has no valid index",
-                           code="REFERENCE_UNRESOLVED", node_id=node_id, step="resolve_top_face")
-    if len(candidates) > 1 and abs(candidates[1][0] - top_y) < _TIE_EPS:
-        raise FeatureError("top face is ambiguous — multiple upward faces at the same height",
-                           code="REFERENCE_AMBIGUOUS", node_id=node_id, step="resolve_top_face")
+    best_extent, best_i, best_face = candidates[0]
+    if best_i < 0:
+        raise FeatureError("resolved %s face has no valid index" % selector,
+                           code="REFERENCE_UNRESOLVED", node_id=node_id, step=step)
+    if len(candidates) > 1 and abs(candidates[1][0] - best_extent) < _TIE_EPS:
+        raise FeatureError("%s face is ambiguous — multiple %s-facing faces at the same extent"
+                           % (selector, selector),
+                           code="REFERENCE_AMBIGUOUS", node_id=node_id, step=step)
 
-    return top_i, {"face_index": top_i, "centroid_y": top_y, "point": top_face.get("point")}
+    info = {"face_index": best_i, "selector": selector, "extent": best_extent,
+            "point": best_face.get("point")}
+    if selector == "top":
+        info["centroid_y"] = best_extent   # back-compat with v0 callers/tests
+    return best_i, info
+
+
+def resolve_top_face(port, state_version, node_id=None):
+    """Back-compat wrapper: the semantic 'top' face (see resolve_face)."""
+    return resolve_face(port, state_version, "top", node_id=node_id)
 
 
 def resolve_center_on_face(face_info):

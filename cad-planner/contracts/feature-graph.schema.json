@@ -78,7 +78,12 @@
   ],
   "datum_offset": "any signed number of meters (0/omitted = the datum plane itself)",
   "face_selectors": [
-   "top"
+   "top",
+   "bottom",
+   "front",
+   "back",
+   "right",
+   "left"
   ],
   "positions": [
    "center"

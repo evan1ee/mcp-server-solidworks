@@ -449,13 +449,13 @@ def lower_mate(node, sides):
                % (node["mate_type"], an, ak, int(ai), bn, bk, int(bi)))]
 
 
-def lower_hole(node, face_index, center2d):
+def lower_hole(node, face_index, center2d, selector="top"):
     """hole -> create_sketch(on_face, face_index) + circle at the resolved centre + through cut."""
     r = float(node["diameter"]) / 2.0
     cx, cy = center2d
     return [
         Op("create_sketch", {"on_face": True, "face_index": int(face_index)},
-           "hole: sketch on top face #%d" % face_index),
+           "hole: sketch on %s face #%d" % (selector, face_index)),
         Op("add_sketch_entity", {"entity_type": "circle", "cx": cx, "cy": cy, "radius": r},
            "hole: circle at centre"),
         Op("extrude_feature", {"feature_type": "cut", "through": True}, "hole: through-all cut"),

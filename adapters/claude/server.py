@@ -916,7 +916,10 @@ def analyze_model(
     analysis_type='faces': returns a JSON object listing EVERY solid face with a stable index `i`; planar faces
         also carry normal, area, and a representative on-plane point (meters, rounded to 6 decimals). Use the
         index `i` for create_sketch(on_face=True, face_index=i) — robust where a coordinate pick is ambiguous
-        (e.g. a revolve end-cap / shaft end whose centre lies on the axis). TARGETED: pass near='[x,y,z]'
+        (e.g. a revolve end-cap / shaft end whose centre lies on the axis). Every face has `kind`
+        (plane/cylinder/cone/sphere/torus/other) and `reversed` (outward normal opposes the surface normal);
+        cylinder/cone/sphere/torus add origin/axis/radius (cone half_angle; torus major_radius/minor_radius).
+        TARGETED: pass near='[x,y,z]'
         (+ optional k, axis) for only the k nearest faces to a point — see near/k/axis below.
     analysis_type='features': the part's COMPACT RECIPE — this is the default "understand the part" read. Returns
         the ordered feature tree (name/type; suppressed shown only when true), each feature's driving dimensions

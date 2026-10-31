@@ -13,7 +13,7 @@ from .errors import FeatureError
 from .ir_schema import validate
 from .resolver import (resolve_center_on_face, resolve_component_entity_by_anchor,
                        resolve_edges_by_anchor, resolve_face_by_anchor, resolve_face_on_plane,
-                       resolve_top_face)
+                       resolve_face)
 
 
 class CompileResult(object):
@@ -225,9 +225,10 @@ def _plan_node(port, node, state_version, node_features):
     if ntype == "circular_pattern":
         return lowering.lower_circular_pattern(node)
     if ntype == "hole":
-        face_index, info = resolve_top_face(port, state_version, node_id=node.get("id"))
+        selector = (node.get("ref") or {}).get("node_face", {}).get("selector", "top")
+        face_index, info = resolve_face(port, state_version, selector, node_id=node.get("id"))
         center2d = resolve_center_on_face(info)
-        return lowering.lower_hole(node, face_index, center2d)
+        return lowering.lower_hole(node, face_index, center2d, selector)
     if ntype == "fillet":
         edge_indices, _info = resolve_edges_by_anchor(port, state_version, node["edges"],
                                                       node_id=node.get("id"))

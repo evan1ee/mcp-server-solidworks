@@ -10,6 +10,7 @@ Run two ways:
 import json
 import os
 import sys
+import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COMPILER_ROOT = os.path.dirname(os.path.dirname(_HERE))  # compiler/solidworks/
@@ -172,11 +173,47 @@ def test_validation_rejects_with_no_execution():
 
 def test_unsupported_selector_rejected():
     g = json.loads(json.dumps(EXAMPLE))
-    g["nodes"][1]["ref"]["node_face"]["selector"] = "bottom"
+    g["nodes"][1]["ref"]["node_face"]["selector"] = "diagonal"
     port = FakePort()
     r = compile_and_run(port, g)
     assert r.status == "FAILED" and r.error["code"] == "VALIDATION_FAILED"
     assert port.calls == []
+
+
+# selector -> the _BOX_FACES index whose outward normal it must pick
+@pytest.mark.parametrize("selector,expected", [
+    ("top", 0), ("bottom", 1), ("right", 2), ("left", 3), ("front", 4), ("back", 5),
+])
+def test_hole_on_each_side_face(selector, expected):
+    g = json.loads(json.dumps(EXAMPLE))
+    g["nodes"][1]["ref"]["node_face"]["selector"] = selector
+    port = FakePort()
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    assert port.calls[4][1] == {"on_face": True, "face_index": expected}
+
+
+def test_side_face_ignores_curved_and_picks_extreme():
+    # A cylinder facing +X (non-planar) and a nearer +X plane must not beat the outermost +X plane.
+    faces = json.loads(_BOX_FACES)
+    faces["faces"].append({"i": 6, "planar": False, "kind": "cylinder", "point": [0.5, 0, 0]})
+    faces["faces"].append({"i": 7, "planar": True, "area": 0.001, "normal": [1, 0, 0], "point": [0.01, 0.02, 0]})
+    g = json.loads(json.dumps(EXAMPLE))
+    g["nodes"][1]["ref"]["node_face"]["selector"] = "right"
+    port = FakePort(faces=json.dumps(faces))
+    r = compile_and_run(port, g)
+    assert r.status == "COMPLETED", r.to_dict()
+    assert port.calls[4][1]["face_index"] == 2   # x=0.025, not x=0.01
+
+
+def test_side_face_tie_is_ambiguous():
+    faces = json.loads(_BOX_FACES)
+    faces["faces"].append({"i": 6, "planar": True, "area": 0.001, "normal": [0, 0, 1], "point": [0.01, 0.02, 0.025]})
+    g = json.loads(json.dumps(EXAMPLE))
+    g["nodes"][1]["ref"]["node_face"]["selector"] = "front"
+    port = FakePort(faces=json.dumps(faces))
+    r = compile_and_run(port, g)
+    assert r.status == "FAILED" and r.error["code"] == "REFERENCE_AMBIGUOUS"
 
 
 def test_partial_progress_on_cut_failure():

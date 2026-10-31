@@ -43,7 +43,7 @@ NODE_TYPES = frozenset(("box", "sketch", "extrude", "revolve", "sweep", "rib", "
 PROFILE_KINDS = frozenset(("rectangle", "circle", "line", "arc", "ellipse", "spline"))
 # Optional boolean flags any profile primitive may carry (mirrors analyze_model's per-segment flag).
 PROFILE_FLAGS = frozenset(("construction",))
-FACE_SELECTORS = frozenset(("top",))          # v0.5: only 'top'
+FACE_SELECTORS = frozenset(("top", "bottom", "front", "back", "right", "left"))  # planar side selectors (see resolver.FACE_DIRECTIONS)
 POSITIONS = frozenset(("center",))            # v0.5: only 'center'
 THROUGH_DEPTHS = frozenset(("through_all", "through"))
 EXTRUDE_ENDS = frozenset(("blind", "through_all", "up_to_surface", "mid_plane"))
