@@ -9,6 +9,7 @@
 !master-architecture.md
 !architecture.md
 !recipe-usage.md
+!/CLAUDE.md
 !docs/*.md
 
 # CI workflow stays LOCAL-ONLY (project decision 2026-07-19) — private dev artifact,
