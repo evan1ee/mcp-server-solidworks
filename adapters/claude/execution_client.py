@@ -200,9 +200,13 @@ def get_state() -> int:
     return sv
 
 
-def call_tool(tool_name: str, operation_id: str, state_version: int, params: dict) -> dict:
+def call_tool(tool_name: str, operation_id: str, state_version: int, params: dict,
+              timeout: "float | None" = None) -> dict:
     """
     POST /api/tool/execute on the solidworks-execution layer.
+
+    timeout: seconds for this request (default HTTP_TIMEOUT) — for the few reads that are slow by
+    nature, e.g. analyze_model(brep) on a big part (every face/edge is a cross-process COM round trip).
 
     Returns the parsed JSON response body on HTTP 200.
     Raises ExecutionLayerError on HTTP 400 or unexpected status codes.
@@ -216,16 +220,18 @@ def call_tool(tool_name: str, operation_id: str, state_version: int, params: dic
 
     _log(f"-> {tool_name} op={operation_id} sv={state_version}")
 
+    limit = HTTP_TIMEOUT if timeout is None else float(timeout)
+
     def _do():
-        with _http_client(timeout=HTTP_TIMEOUT) as client:
+        with _http_client(timeout=limit) as client:
             return client.post(EXECUTE_ENDPOINT, json=payload)
 
     try:
         response = _request_with_autostart(_do, tool_name)
     except httpx.TimeoutException:
-        _log(f"<- {tool_name} TIMEOUT after {HTTP_TIMEOUT}s")
+        _log(f"<- {tool_name} TIMEOUT after {limit}s")
         raise ExecutionLayerError(
-            f"Request to solidworks-execution timed out after {HTTP_TIMEOUT}s."
+            f"Request to solidworks-execution timed out after {limit}s."
         )
 
     if response.status_code == 400:

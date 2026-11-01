@@ -21,6 +21,8 @@ That file pulls the runtime requirements (`mcp`, `httpx`, `python-dotenv`, `ezdx
 | IR contract | `cd compiler/solidworks && python -m pycompiler.tests.test_ir_schema_contract` | schema `covered_subset` ⇔ `ir_schema.py` |
 | Compiler | `cd compiler/solidworks && python -m pycompiler.tests.test_compiler` | validation, lowering, resolver, frames, failures (FakePort) |
 | Drawing reader | `cd cad-planner/drawing && python -m tests.test_draw_contract` | dialect drift, chaining/pairing/gate goldens, IR validity |
+| STEP recognizer | `python cad-planner/recognition/tests/test_recognition.py` | blends, classification, prismatic/turned decomposition, IR validity on recorded STEP-import fixtures |
+| Convert tool | `cd adapters/claude && python tests/test_convert_features.py` | `convert_to_features` orchestration (history guard, drop-and-continue, labels, artifact) with SolidWorks faked |
 
 Each also runs under pytest, e.g. `pytest compiler/solidworks/pycompiler/tests/test_compiler.py::test_sketch_extrude_boss_path`. The standalone runners print `ok`/`FAIL` per test and exit non-zero on failure.
 
@@ -28,11 +30,13 @@ Each also runs under pytest, e.g. `pytest compiler/solidworks/pycompiler/tests/t
 
 | Edited path | Suites re-run |
 |---|---|
-| `adapters/claude/`, `tool-schemas.json`, `recipe-usage.md` | tool contract |
+| `adapters/claude/` | tool contract, convert tool |
+| `tool-schemas.json`, `recipe-usage.md` | tool contract |
 | `compiler/solidworks/pycompiler/` | IR contract, compiler, drawing |
 | `feature-graph.schema.json` | IR contract, drawing |
 | `cad-planner/drawing/` | drawing, tool contract |
 | `draw-dialect.schema.json` | drawing |
+| `cad-planner/recognition/` | STEP recognizer, convert tool |
 
 ## Execution layer
 

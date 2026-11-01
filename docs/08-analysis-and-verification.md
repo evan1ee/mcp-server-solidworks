@@ -57,6 +57,18 @@ From the recipe's `verification` section:
 
 `analyze_drawing` either builds a sheet-metal flat pattern directly (and reports the expected volume = blank area × thickness to check against), or returns the full analysis for the model to read under `get_recipe('reverse')` and author IR through `submit_feature_graph`. Production drawings are verified against the weight in their own title block. See [07](07-drawing-reader.md).
 
+## STEP → feature-based part
+
+`convert_to_features(file_path, output_path?)` turns a "dumb" imported body (STEP/IGES, or a `.sldprt` whose tree holds only the import — `MBimport`/`BaseBody`) into a feature tree, deterministically:
+
+1. **Read** — `analyze_model(brep)`: faces (type, surface params, outward normal), edges (line/circle data, `pmid`, the two adjacent faces, convex/concave/tangent). Loops are rebuilt in Python from adjacency (walking them over COM cost ~0.4 s/face).
+2. **Recognize** — `cad-planner/recognition` (stdlib only): merge the import's split half-faces; detect blends (fillet = tangent cylinder/torus between non-parallel supports; chamfer = narrow convex plane, or a coaxial cone on turned parts) and the sharp edge each replaced; classify **prismatic** (2.5D along X/Y/Z) or **turned** (coaxial surfaces ≥ 80 % of the lateral area); refuse `MULTIBODY`, `UNSUPPORTED_GEOMETRY`, `NOT_AXIS_ALIGNED`.
+3. **Decompose** — prismatic: base boss = largest cap silhouette; every lower floor → cut down from the top; every raised ceiling → cut up from the bottom; unexplained inner loops of the extreme caps → through-all cuts; cross holes → mid-plane circle cuts. Turned: ONE revolve of the sharp-cornered half-section on the datum containing the axis, then hole cuts. Edge blends come back as `chamfer`/`fillet` nodes anchored on the sharp edge (straight: its midpoint; revolve circles: centre − r·N, the live-calibrated mid rule).
+4. **Build** through `_run_graph` (fresh part); a node that fails is dropped (with its sketch) and the rest continues → the result is UNVERIFIED and lists `dropped=`. A failing base feature is `BUILD_FAILED` (nothing saved). An existing output is refused (`OUTPUT_EXISTS`) unless `overwrite=True`; the input is never the output.
+5. **Verify like with like** — a STEP import splits every cylinder in two and a native rebuild does not, so the rebuild is exported to STEP, re-imported and `compare_parts`-ed against the original import under the strict definition above — **plus** position checks the counts/volume/area criteria lack (a hole mirrored to the wrong side keeps all of them): every surface must pair in the face diff and the centre of gravity may move at most 10 µm. VERIFIED also requires no dropped node and no unexplained face; anything else is saved and labelled UNVERIFIED. The artifact (`.solidpilot/<output>.analysis.json`) records the IR and `ir.verification` (`failed` + `MISMATCH`/`BUILD_FAILED` on a miss).
+
+Calibrated facts it relies on (SW 2025): datum frames front (X, Y) / top (X, −Z) / right (−Z, Y); a blind boss runs along the datum +normal, a blind cut along −normal; cones narrow along +axis; a forward-slash STEP path fails `LoadFile4` (inputs are normalized). Offline fixtures are real import dumps — see `cad-planner/recognition/tests/record_fixtures.md`.
+
 ## Coverage reporting
 
 Batch runs end with `parts_total / verified_without_ai / verified_with_ai / unverified / failed`, plus a ranked list of missing vocabulary drawn from the failures (recipe `coverage` section). Growing the IR vocabulary from these real gaps is how the project advances.

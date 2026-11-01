@@ -352,7 +352,7 @@
    "operation_id": "string (required, unique idempotency key)",
    "state_version": "integer (required, must match current execution state)",
    "params": {
-    "analysis_type": "string (required: 'mass_properties', 'geometry', 'bodies', 'edges', 'faces', 'features', 'sketch', or 'feature_map')",
+    "analysis_type": "string (required: 'mass_properties', 'geometry', 'bodies', 'edges', 'faces', 'features', 'sketch', 'feature_map', or 'brep' — full single-body boundary representation: faces with surface params/outward normal/loops, edges with curve data/adjacent faces/convexity)",
     "name": "string (required only for analysis_type='sketch' — the sketch feature name, e.g. 'Sketch2')",
     "from_feature": "string (optional, feature_map only — start the walk at this tree feature name; default = tree base)",
     "to_feature": "string (optional, feature_map only — end the walk at this tree feature name; default = tree end)",
@@ -673,5 +673,17 @@
    }
   },
   "output": "-> see execution-response.json - Features = [file name, 'body_name=<source body name>' when available]"
+ },
+ "convert_to_features": {
+  "description": "ADAPTER-ONLY orchestration (no ToolController/SolidWorksService case) — STEP/IGES or history-less .SLDPRT → feature-based part. Opens the input, refuses real feature history (HAS_HISTORY), reads analyze_model(brep), runs the CAD-neutral recognizer (cad-planner/recognition) to a Feature Graph IR, builds it through _run_graph → pycompiler (dropping a node that fails and continuing), saves the rebuild, verifies it by exporting it to STEP, re-importing and running compare_parts against the original import, and writes an analysis artifact with the IR + verification. VERIFIED/UNVERIFIED label; the input file is never modified.",
+  "input": {
+   "operation_id": "n/a at this level — each underlying call carries its own operation_id (uuid4)",
+   "state_version": "n/a at this level — the adapter threads/resyncs its tracked state_version",
+   "params": {
+    "file_path": "string (required — absolute path of a .step/.stp/.igs/.iges file or a .sldprt holding only an imported body)",
+    "output_path": "string (optional — .SLDPRT to save the feature-based part to; blank = '<input name>_features.SLDPRT' beside the input; must differ from the input)",
+    "overwrite": "boolean (optional, default false — replace output_path if it exists; otherwise OUTPUT_EXISTS)"
+   }
+  }
  }
 }

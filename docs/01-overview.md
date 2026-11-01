@@ -21,6 +21,7 @@ So one model call can produce an entire part, and everything below the IR is rep
 | Build from design intent | `submit_feature_graph` (forward IR door) | Live |
 | Reproduce an existing part/assembly from its IR | `save_analysis` → model writes IR → `rebuild_from_ir` → `compare_parts` | Live; real production parts reproduced to `verified` |
 | Rebuild a part from a 2D drawing file | `analyze_drawing` (.DXF/.DWG) | Sheet-metal flat patterns build directly; other parts return an analysis for the model to interpret |
+| Convert a STEP / imported body into a feature-based part | `convert_to_features` | Live; machined prismatic + turned single-body parts, axis-aligned, verified by round-trip |
 | Single high-level tool replacing the low-level surface | — | Planned; blocked on a reference resolver that survives edits |
 
 ## Repository map
@@ -30,6 +31,7 @@ adapters/claude/          Python MCP server (the only thing the AI client talks 
 cad-planner/              CAD-neutral: IR schema + capability registry, recipe for the model,
   contracts/              analysis-artifact & draw-dialect schemas
   drawing/                DXF/DWG → analysis → IR reader
+  recognition/            STEP-import B-rep → feature recognition → IR (convert_to_features)
   recipe-usage.md         rules the model follows when writing IR (served over MCP)
 compiler/solidworks/      pycompiler: deterministic IR → tool-call compiler + reference resolver
 execution/solidworks/     C# .NET 4.8 REST server — the only layer touching SolidWorks COM

@@ -190,6 +190,17 @@ namespace SolidworksExecution.Services
                     JObject faceAnalysis = ReadFaces(partDoc, near, k, axis);
                     results.Add(faceAnalysis.ToString(Newtonsoft.Json.Formatting.None));
                 }
+                else if (analysisType == "brep")
+                {
+                    // Full B-rep of a single solid body (faces + surface params + loops, edges + curve
+                    // data + adjacency + convexity) — the STEP→features recognizer's input. Read-only.
+                    var partDoc = modelDoc as IPartDoc;
+                    if (partDoc == null)
+                        return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                            "WRONG_DOCUMENT_TYPE",
+                            "analysis_type='brep' requires a part document.");
+                    results.Add(ReadBrep(partDoc).ToString(Newtonsoft.Json.Formatting.None));
+                }
                 else if (analysisType == "features")
                 {
                     // Feature-tree read for the "analyze -> build a variant" loop. Read-only.

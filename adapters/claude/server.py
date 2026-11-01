@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
@@ -12,6 +13,7 @@ from mcp.server.caching import CacheHint
 from mcp.server.mcpserver.exceptions import ResourceError
 from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
 from response_mapper import map_response
+from adapter_log import write as _adapter_log
 # NOTE: pycompiler is reached via `from ir_execution_port import run_feature_graph` imported
 # LAZILY inside rebuild_from_ir and submit_feature_graph — a missing compiler tree degrades to a
 # clean tool error instead of killing the whole MCP server at startup.
@@ -892,7 +894,7 @@ def save_document(file_path: str = "") -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool(structured_output=False)
 def analyze_model(
-    analysis_type: Literal["mass_properties", "geometry", "bodies", "edges", "faces", "features", "sketch", "feature_map"],
+    analysis_type: Literal["mass_properties", "geometry", "bodies", "edges", "faces", "features", "sketch", "feature_map", "brep"],
     name: str = "",
     from_feature: str = "",
     to_feature: str = "",
@@ -918,6 +920,12 @@ def analyze_model(
         index `i` for create_sketch(on_face=True, face_index=i) — robust where a coordinate pick is ambiguous
         (e.g. a revolve end-cap / shaft end whose centre lies on the axis). TARGETED: pass near='[x,y,z]'
         (+ optional k, axis) for only the k nearest faces to a point — see near/k/axis below.
+    analysis_type='brep': the FULL boundary representation of a SINGLE-body part (large; meant for the
+        convert_to_features recognizer, rarely needed directly). Faces: type (plane/cylinder/cone/sphere/
+        torus/other), surface params, OUTWARD normal at a representative point, and loops (outer/inner,
+        edge indices). Edges: type (line/circle/other), start/end/mid (same mid as 'edges'), circle centre/
+        axis/radius, the two adjacent face indices and convexity (convex/concave/tangent). A multibody
+        part returns only {body_count}. Indices match the 'faces' and 'edges' modes.
     analysis_type='features': the part's COMPACT RECIPE — this is the default "understand the part" read. Returns
         the ordered feature tree (name/type; suppressed shown only when true), each feature's driving dimensions
         (deduped, SI meters/radians, rounded to 6 decimals), a per-sketch SUMMARY (segment counts + an inline
@@ -983,6 +991,15 @@ try:
 except Exception as _exc:                     # noqa: BLE001 - startup must survive anything
     _draw = None
     _DXF_READER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc} (pip install ezdxf)"
+
+# The STEP→features recognizer (cad-planner/recognition): stdlib-only, so a plain import — kept next
+# to `drawing` and equally non-fatal.
+try:
+    import recognition as _recognition
+    _RECOGNITION_IMPORT_ERROR = None
+except Exception as _exc:                     # noqa: BLE001 - startup must survive anything
+    _recognition = None
+    _RECOGNITION_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
 def _summarise_direct(art, summary, graph):
@@ -2003,16 +2020,17 @@ def _analysis_artifact_schema() -> str:
 ANALYSIS_SCHEMA_VERSION = "0.1.0-draft"  # cad-planner/contracts/analysis-artifact.schema.json
 
 
-def _call_raw(tool_name: str, params: dict) -> dict:
+def _call_raw(tool_name: str, params: dict, timeout: Optional[float] = None) -> dict:
     """Like _call() but returns the RAW ExecutionResponse dict (no string mapping, no raise).
 
     Used by adapter-side orchestration (save_analysis) that needs the structured payloads the
-    analyze tools carry in `result_geometry`. Same one-shot resync-retry on INVALID_STATE_VERSION."""
+    analyze tools carry in `result_geometry`. Same one-shot resync-retry on INVALID_STATE_VERSION.
+    timeout: optional per-request seconds (default: the client's HTTP_TIMEOUT)."""
     global _state_version
-    response = call_tool(tool_name, _next_operation_id(), _state_version, params)
+    response = call_tool(tool_name, _next_operation_id(), _state_version, params, timeout=timeout)
     if _is_state_mismatch(response):
         _state_version = get_state()
-        response = call_tool(tool_name, _next_operation_id(), _state_version, params)
+        response = call_tool(tool_name, _next_operation_id(), _state_version, params, timeout=timeout)
     _update_state_version(response)
     return response
 
@@ -2338,6 +2356,45 @@ def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
         point-query can't do — it turns "which face did my rebuild add/drop?" into one call instead
         of manually pairing two full face lists. Faces are reported with their key attributes + the
         stable index `i` in their own document."""
+    want_faces = detail == "faces"
+    try:
+        v = _compare_docs(doc_a, doc_b, want_faces)
+    except RuntimeError as ex:
+        return f"FAILED | {ex}"
+    topo_a, topo_b, dv, da, cg_dist = v["topo_a"], v["topo_b"], v["dv"], v["da"], v["cg_dist"]
+    mass_a, mass_b = v["mass_a"], v["mass_b"]
+    verified, topology_exact = v["verified"], v["topology_exact"]
+
+    fmt = lambda x, spec=".6g": ("?" if x is None else format(x, spec))  # noqa: E731
+    line = (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
+            f"topology A={'-'.join(str(t) for t in topo_a)} B={'-'.join(str(t) for t in topo_b)} "
+            f"{'EXACT' if topology_exact else 'DIFFER'} | "
+            f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
+            f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
+            f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
+
+    if want_faces:
+        missing, extra = v["missing"], v["extra"]
+        line += (f"\nfaces: matched={v['face_count_a'] - len(missing)} "
+                 f"MISSING(in A only)={len(missing)} EXTRA(in B only)={len(extra)}")
+
+        def _list(faces, cap=20):
+            shown = "; ".join(_face_desc(f) for f in faces[:cap])
+            if len(faces) > cap:
+                shown += f"; …(+{len(faces) - cap} more)"
+            return shown
+        if missing:
+            line += "\n  MISSING: " + _list(missing)
+        if extra:
+            line += "\n  EXTRA:   " + _list(extra)
+    return line
+
+
+def _compare_docs(doc_a: str, doc_b: str, want_faces: bool) -> dict:
+    """The measuring + judging half of compare_parts, as data (shared with convert_to_features).
+
+    Returns {verified, topology_exact, topo_a, topo_b, dv, da, cg_dist, mass_a, mass_b,
+    face_count_a, missing, extra}; raises RuntimeError('DOC_<A|B>_UNAVAILABLE | ...')."""
     def _read(doc: str, label: str, want_faces: bool):
         if os.path.isfile(doc):
             r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
@@ -2356,12 +2413,8 @@ def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
             faces = json.loads(items[0]).get("faces", []) if items else []
         return geo, mass, faces
 
-    want_faces = detail == "faces"
-    try:
-        geo_a, mass_a, faces_a = _read(doc_a, "A", want_faces)
-        geo_b, mass_b, faces_b = _read(doc_b, "B", want_faces)
-    except RuntimeError as ex:
-        return f"FAILED | {ex}"
+    geo_a, mass_a, faces_a = _read(doc_a, "A", want_faces)
+    geo_b, mass_b, faces_b = _read(doc_b, "B", want_faces)
 
     topo_keys = ("bodies", "faces", "edges", "vertices")
     topo_a = [geo_a.get(k) for k in topo_keys]
@@ -2382,30 +2435,10 @@ def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
 
     verified = (topology_exact and dv is not None and da is not None
                 and abs(dv) <= 1.0 and abs(da) <= 1.0)
-
-    fmt = lambda v, spec=".6g": ("?" if v is None else format(v, spec))  # noqa: E731
-    line = (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
-            f"topology A={'-'.join(str(t) for t in topo_a)} B={'-'.join(str(t) for t in topo_b)} "
-            f"{'EXACT' if topology_exact else 'DIFFER'} | "
-            f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
-            f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
-            f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
-
-    if want_faces:
-        missing, extra = _diff_faces(faces_a, faces_b)
-        line += (f"\nfaces: matched={len(faces_a) - len(missing)} "
-                 f"MISSING(in A only)={len(missing)} EXTRA(in B only)={len(extra)}")
-
-        def _list(faces, cap=20):
-            shown = "; ".join(_face_desc(f) for f in faces[:cap])
-            if len(faces) > cap:
-                shown += f"; …(+{len(faces) - cap} more)"
-            return shown
-        if missing:
-            line += "\n  MISSING: " + _list(missing)
-        if extra:
-            line += "\n  EXTRA:   " + _list(extra)
-    return line
+    missing, extra = _diff_faces(faces_a, faces_b) if want_faces else ([], [])
+    return {"verified": verified, "topology_exact": topology_exact, "topo_a": topo_a, "topo_b": topo_b,
+            "dv": dv, "da": da, "cg_dist": cg_dist, "mass_a": mass_a, "mass_b": mass_b,
+            "face_count_a": len(faces_a or []), "missing": missing, "extra": extra}
 
 
 _FACE_POS_TOL = 5e-5   # 50µm — supporting plane offset / point match
@@ -2600,7 +2633,7 @@ def _resync_state_version() -> int:
     return _state_version
 
 
-def _run_graph(graph_obj, fresh_document):
+def _run_graph(graph_obj, fresh_document, want_result=False):
     """The ONE path from a Feature Graph to live geometry — shared by every IR door.
 
     IR-ADR-005 forbids FORKING the compiler, not having several doors into it. There are three
@@ -2608,7 +2641,9 @@ def _run_graph(graph_obj, fresh_document):
     analyze_drawing(mode='build') lowers a drawing), and they all land here, so the document
     choice, the compiler entry point and the post-run resync cannot diverge between them.
 
-    Returns (text, ok, state_version). On failure `text` is already a complete FAILED line."""
+    Returns (text, ok, state_version) — or, with want_result=True, (text, ok, state_version,
+    CompileResult | None) for callers that react to WHICH node failed (convert_to_features).
+    On failure `text` is already a complete FAILED line."""
     if fresh_document:
         # The graph type picks the document: an assembly graph (component/mate nodes) needs an
         # assembly, a part graph a part.
@@ -2619,15 +2654,16 @@ def _run_graph(graph_obj, fresh_document):
         opened = _call_raw(new_tool, {})
         if opened.get("status") != "COMPLETED":
             err = opened.get("error") or {}
-            return (f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}",
-                    False, _state_version)
+            text = f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
+            return (text, False, _state_version, None) if want_result else (text, False, _state_version)
 
     # Lazy import: a missing compiler tree degrades to a clean tool error instead of killing the
     # whole MCP server at startup.
     try:
         from ir_execution_port import run_feature_graph
     except Exception as ex:  # noqa: BLE001
-        return f"FAILED | COMPILER_UNAVAILABLE | {ex}", False, _state_version
+        text = f"FAILED | COMPILER_UNAVAILABLE | {ex}"
+        return (text, False, _state_version, None) if want_result else (text, False, _state_version)
 
     # NEVER let an exception crash the MCP server; resync state_version regardless (IR-ADR-001) —
     # one run performs MANY state-bumping sub-ops outside _call() (KNOWN-LIMITATIONS #5).
@@ -2635,9 +2671,10 @@ def _run_graph(graph_obj, fresh_document):
         result = run_feature_graph(graph_obj)
     except Exception as ex:  # noqa: BLE001
         sv = _resync_state_version()
-        return (f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}",
-                False, sv)
-    return result.summary(), True, _resync_state_version()
+        text = f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
+        return (text, False, sv, None) if want_result else (text, False, sv)
+    sv = _resync_state_version()
+    return (result.summary(), True, sv, result) if want_result else (result.summary(), True, sv)
 
 
 @mcp.tool(structured_output=False)
@@ -2683,6 +2720,275 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
 
     text, ok, sv = _run_graph(graph_obj, fresh_document)
     return text + (f" | state_version={sv}" if ok else "")
+
+
+# ---------------------------------------------------------------------------
+# Tool: convert_to_features  (adapter-only — STEP / history-less part → feature-based part)
+#   open → history guard → analyze_model(brep) → cad-planner/recognition → _run_graph (the ONE
+#   compile path) → save → verify (rebuild re-imported via STEP vs the original import) → artifact.
+# ---------------------------------------------------------------------------
+_CONVERT_INPUT_EXTS = (".step", ".stp", ".igs", ".iges", ".sldprt")
+_IMPORT_FEATURE_TYPES = ("MBimport", "BaseBody")   # what a STEP import leaves in the tree (SW 2025)
+_NON_SOLID_TYPES = ("RefPlane", "RefAxis", "RefPoint", "OriginProfileFeature", "DetailCabinet")
+_BREP_TIMEOUT_S = 600.0     # brep is ~0.15–0.3 s per face/edge over cross-process COM
+_MAX_BUILD_ROUNDS = 10
+_CONVERT_CG_TOL_M = 1e-5    # 10 µm: a feature built in the wrong PLACE moves the centre of gravity
+
+
+class _RecognitionView(tuple):
+    """(status, part_class, graph, unexplained_faces, notes) — the shape convert_to_features reads
+    from recognition.RecognitionResult (a separate type so tests can fake the recognizer)."""
+    __slots__ = ()
+
+    def __new__(cls, status, part_class, graph, unexplained_faces, notes):
+        return tuple.__new__(cls, (status, part_class, graph, tuple(unexplained_faces), tuple(notes)))
+
+    status = property(lambda s: s[0])
+    part_class = property(lambda s: s[1])
+    graph = property(lambda s: s[2])
+    unexplained_faces = property(lambda s: s[3])
+    notes = property(lambda s: s[4])
+
+
+def _recognize_brep(brep: dict) -> _RecognitionView:
+    if _recognition is None:
+        return _RecognitionView("RECOGNIZER_UNAVAILABLE", None, None, (), (_RECOGNITION_IMPORT_ERROR,))
+    r = _recognition.recognize(brep)
+    return _RecognitionView(r.status, r.part_class, r.graph, r.unexplained_faces, r.notes)
+
+
+def _default_output_path(src: str) -> str:
+    stem = os.path.splitext(os.path.basename(src))[0]
+    return os.path.join(os.path.dirname(src), stem + "_features.SLDPRT")
+
+
+def _is_history_less(features: list) -> bool:
+    """True iff the tree holds an import body and NOTHING solid-producing besides it (folders,
+    datums and the origin are ignored). A sketch or any modelling feature ⇒ real history."""
+    kinds = [f.get("type", "") for f in features if isinstance(f, dict)]
+    relevant = [k for k in kinds if "Folder" not in k and k not in _NON_SOLID_TYPES]
+    return bool(relevant) and all(k in _IMPORT_FEATURE_TYPES for k in relevant)
+
+
+def _drop_failed(graph: dict, failed_id: str):
+    """(graph of the nodes AFTER the failed one, dropped ids). A failed extrude/revolve takes its
+    sketch with it; a failed sketch takes the feature that consumes it."""
+    nodes = graph.get("nodes") or []
+    idx = next((i for i, n in enumerate(nodes) if n.get("id") == failed_id), None)
+    if idx is None:
+        raise KeyError(failed_id)
+    lo, hi = idx, idx
+    kind = nodes[idx].get("type")
+    if kind in ("extrude", "revolve") and idx > 0 and nodes[idx - 1].get("type") == "sketch":
+        lo = idx - 1
+    elif kind == "sketch" and idx + 1 < len(nodes) and nodes[idx + 1].get("type") in ("extrude", "revolve"):
+        hi = idx + 1
+    rest = dict(graph, nodes=nodes[hi + 1:])
+    return rest, [n.get("id") for n in nodes[lo:hi + 1]]
+
+
+def _active_title(resp: dict) -> str:
+    return ((resp or {}).get("cadState") or {}).get("activeDocument") or ""
+
+
+def _build_with_drops(graph: dict):
+    """Build the graph in a fresh part; on a node failure drop that node (+ its sketch partner) and
+    continue with the rest in the same document. Returns (ok, dropped_ids, last_text)."""
+    remaining, dropped, fresh = graph, [], True
+    base_ids = {n.get("id") for n in (graph.get("nodes") or [])[:2]}   # the base sketch + boss/revolve
+    for _ in range(_MAX_BUILD_ROUNDS):
+        if not remaining.get("nodes"):
+            return True, dropped, "COMPLETED | nothing left to build"
+        text, ok, _sv, result = _run_graph(remaining, fresh, want_result=True)
+        fresh = False
+        if not ok or result is None:
+            return False, dropped, text
+        if result.status == "COMPLETED":
+            return True, dropped, text
+        node_id = (result.error or {}).get("node_id")
+        if not node_id or node_id in base_ids:
+            return False, dropped, text   # no base body => nothing worth saving
+        _adapter_log(f"convert_to_features: node {node_id} failed — dropping it and continuing ({text})")
+        try:
+            remaining, gone = _drop_failed(remaining, node_id)
+        except KeyError:
+            return False, dropped, text
+        dropped.extend(gone)
+    return False, dropped, "FAILED | TOO_MANY_FAILURES"
+
+
+def _verify_by_reimport(original_title: str, rebuild_title: str):
+    """Compare like with like: a STEP import splits every cylinder/cone in two, a native rebuild
+    does not — so the rebuild is exported to STEP, re-imported, and THAT is compared to the original
+    import (the strict verified definition then applies unchanged)."""
+    tmp = os.path.join(tempfile.gettempdir(), "solidpilot_verify_%s.step" % uuid.uuid4().hex[:8])
+    _call_raw("activate_document", {"title": rebuild_title})
+    exp = _call_raw("export_document", {"format": "STEP", "file_path": tmp})
+    if exp.get("status") != "COMPLETED":
+        raise RuntimeError("VERIFY_EXPORT_FAILED | %s" % (exp.get("error") or {}).get("message"))
+    opened = _call_raw("open_document", {"file_path": tmp})
+    if opened.get("status") != "COMPLETED":
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError("VERIFY_IMPORT_FAILED | %s" % (opened.get("error") or {}).get("message"))
+    reimport_title = _active_title(opened)
+    try:
+        return _compare_docs(original_title, reimport_title, True)
+    finally:
+        _call_raw("activate_document", {"title": reimport_title})
+        _call_raw("close_document", {"save": False})
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        _call_raw("activate_document", {"title": rebuild_title})
+
+
+def _convert_label(verdict: dict, dropped: list, unexplained) -> str:
+    """VERIFIED needs more than the counts + |dV|,|dA| criteria, which are blind to WHERE a feature
+    sits (a hole mirrored to the wrong side keeps every count, volume and area): the face diff must
+    pair every surface and the centre of gravity must not move."""
+    placed = (not verdict.get("missing") and not verdict.get("extra")
+              and verdict.get("cg_dist") is not None and verdict["cg_dist"] <= _CONVERT_CG_TOL_M)
+    if verdict.get("verified") and placed and not dropped and not unexplained:
+        return "VERIFIED"
+    geometry_ok = (not verdict.get("missing") and not verdict.get("extra")
+                   and verdict.get("dv") is not None and abs(verdict["dv"]) <= 1.0
+                   and verdict.get("da") is not None and abs(verdict["da"]) <= 1.0)
+    if not verdict.get("topology_exact") and geometry_ok and not dropped and not unexplained:
+        return "UNVERIFIED (geometry matches, topology split differs)"
+    return "UNVERIFIED"
+
+
+def _write_convert_artifact(out: str, graph: dict, verdict: dict, label: str, dropped, unexplained) -> str:
+    with open(out, "rb") as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
+    status = "verified" if label == "VERIFIED" else "failed"
+    cg = verdict.get("cg_dist")
+    detail = {"topology": {"original": verdict.get("topo_a"), "rebuilt": verdict.get("topo_b")},
+              "volume_delta_pct": verdict.get("dv"), "surface_delta_pct": verdict.get("da"),
+              "cg_delta_mm": None if cg is None else cg * 1000.0}
+    if status == "failed":
+        detail.update({"reason": "BUILD_FAILED" if dropped else "MISMATCH", "dropped_nodes": list(dropped),
+                       "unexplained_faces": list(unexplained),
+                       "missing_faces": len(verdict.get("missing") or []), "extra_faces": len(verdict.get("extra") or [])})
+    artifact = {
+        "identity": {"source_path": out, "source_filename": os.path.basename(out), "source_hash": "sha256:" + sha,
+                     "source_mtime": datetime.fromtimestamp(os.path.getmtime(out), timezone.utc).isoformat(),
+                     "schema_version": ANALYSIS_SCHEMA_VERSION,
+                     "analyzed_at": datetime.now(timezone.utc).isoformat(),
+                     "generator": {"kind": "deterministic"}},
+        "document_type": "part",
+        "recipe": None,
+        "parameters": [],
+        "ir": {"ir_schema_version": graph.get("schema_version"), "graph": graph,
+               "generator": {"kind": "deterministic", "recipe_version": "recognition-v1"},
+               "verification": {"status": status, "method": "convert_to_features: rebuild → STEP re-import + compare_parts",
+                                "verified_at": datetime.now(timezone.utc).isoformat(), "detail": detail}},
+        "relationships": {"drawings": [], "category": None, "cluster_signals": {}},
+        "notes": ["written by convert_to_features; recipe not extracted (the IR is the recipe)"],
+    }
+    out_dir = os.path.join(os.path.dirname(out), ".solidpilot")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, os.path.basename(out) + ".analysis.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(artifact, fh, ensure_ascii=False, indent=2)
+    return path
+
+
+@mcp.tool(structured_output=False)
+def convert_to_features(
+    file_path: Annotated[str, Field(description="Absolute path of the input: a STEP/IGES file, or a .SLDPRT that holds only an imported body (no feature history).")],
+    output_path: Annotated[str, Field(description="Where to save the feature-based part (.SLDPRT). Blank = '<input name>_features.SLDPRT' next to the input. Must differ from the input.")] = "",
+    overwrite: Annotated[bool, Field(description="Replace output_path if it already exists (default false: refuse with OUTPUT_EXISTS).")] = False,
+) -> str:
+    """Convert a 'dumb' imported solid (STEP/IGES, or a history-less .SLDPRT) into a FEATURE-BASED
+    SolidWorks part: a real tree of sketches + extrude/revolve + cuts (each hole/pocket/slot its own
+    cut) + chamfers/fillets, rebuilt through the IR compiler and verified against the original.
+
+    Scope (v1): single-body MACHINED PRISMATIC and TURNED parts whose faces are aligned with X/Y/Z.
+    The input file is NEVER modified.
+
+    Returns ONE line:
+      COMPLETED | VERIFIED | ...   the rebuild matches the original exactly (topology + |ΔV|,|ΔA| <= 1%)
+      COMPLETED | UNVERIFIED ...   saved anyway — differences listed (dropped nodes = features that
+                                   failed to build; unexplained_faces = geometry not recognized)
+      FAILED | <CODE> | ...        nothing saved. Codes: FILE_NOT_FOUND, UNSUPPORTED_TYPE,
+                                   OUTPUT_IS_INPUT, OUTPUT_EXISTS (pass overwrite=True), OPEN_FAILED,
+                                   HAS_HISTORY (already feature-based),
+                                   MULTIBODY (split first with save_body_as_part), NOT_AXIS_ALIGNED,
+                                   UNSUPPORTED_GEOMETRY (freeform/sheet metal), BUILD_FAILED.
+    An analysis artifact with the IR and its verification is written to .solidpilot/ next to the
+    output, so rebuild_from_ir can replay it. Large parts take minutes (the B-rep read is slow)."""
+    src = os.path.normpath(os.path.abspath(file_path))
+    if not os.path.isfile(src):
+        return f"FAILED | FILE_NOT_FOUND | {src}"
+    if not src.lower().endswith(_CONVERT_INPUT_EXTS):
+        return f"FAILED | UNSUPPORTED_TYPE | expected one of {', '.join(_CONVERT_INPUT_EXTS)}"
+    out = os.path.normpath(os.path.abspath(output_path)) if output_path else _default_output_path(src)
+    if os.path.normcase(out) == os.path.normcase(src) or (os.path.exists(out) and os.path.samefile(out, src)):
+        return "FAILED | OUTPUT_IS_INPUT | choose an output path different from the input"
+    if os.path.exists(out) and not overwrite:
+        return f"FAILED | OUTPUT_EXISTS | {out} already exists — pass overwrite=True to replace it"
+
+    try:
+        opened = _call_raw("open_document", {"file_path": src})
+        if opened.get("status") != "COMPLETED":
+            err = opened.get("error") or {}
+            return f"FAILED | OPEN_FAILED | {err.get('code')}: {err.get('message')}"
+        original_title = _active_title(opened)
+        tree_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "features", "name": ""}))
+        tree = json.loads(tree_items[0]).get("features", []) if tree_items else []
+        if not _is_history_less(tree):
+            return ("FAILED | HAS_HISTORY | the part already has a feature tree "
+                    "(only imported bodies are converted)")
+        brep_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "brep", "name": ""},
+                                               timeout=_BREP_TIMEOUT_S))
+        brep = json.loads(brep_items[0]) if brep_items else {}
+    except (RuntimeError, ValueError, ExecutionLayerError) as ex:
+        return f"FAILED | READ_FAILED | {ex}"
+
+    rec = _recognize_brep(brep)
+    if rec.status != "OK":
+        return f"FAILED | {rec.status} | {'; '.join(str(n) for n in rec.notes)}"
+
+    built, dropped, build_text = _build_with_drops(rec.graph)
+    if not built:
+        return f"FAILED | BUILD_FAILED | {build_text}"
+    rebuild_title = _active_title(_call_raw("verify_state", {}))
+    saved = _call_raw("save_document", {"file_path": out})
+    if saved.get("status") != "COMPLETED":
+        err = saved.get("error") or {}
+        return f"FAILED | SAVE_FAILED | {err.get('code')}: {err.get('message')}"
+    rebuild_title = _active_title(saved) or rebuild_title
+
+    try:
+        verdict = _verify_by_reimport(original_title, rebuild_title)
+    except (RuntimeError, ExecutionLayerError) as ex:
+        verdict = {"verified": False, "topology_exact": False, "dv": None, "da": None,
+                   "topo_a": None, "topo_b": None, "missing": [], "extra": [], "error": str(ex)}
+    label = _convert_label(verdict, dropped, rec.unexplained_faces)
+    artifact = _write_convert_artifact(out, rec.graph, verdict, label, dropped, rec.unexplained_faces)
+
+    fmt = lambda v: "?" if v is None else format(v, ".4f")  # noqa: E731
+    kinds = {}
+    for n in rec.graph.get("nodes", []):
+        if n.get("type") != "sketch":
+            kinds[n["type"]] = kinds.get(n["type"], 0) + 1
+    line = (f"COMPLETED | {label} | saved={out} | class={rec.part_class} | "
+            f"features={','.join(f'{k}x{v}' for k, v in kinds.items())} | dV={fmt(verdict.get('dv'))}% "
+            f"dA={fmt(verdict.get('da'))}% | topology A={verdict.get('topo_a')} B={verdict.get('topo_b')} | "
+            f"missing_faces={len(verdict.get('missing') or [])} extra_faces={len(verdict.get('extra') or [])} | "
+            f"cg_shift={fmt(None if verdict.get('cg_dist') is None else verdict['cg_dist'] * 1000.0)}mm")
+    if dropped:
+        line += f" | dropped={','.join(dropped)}"
+    if rec.unexplained_faces:
+        line += f" | unexplained_faces={list(rec.unexplained_faces)}"
+    if verdict.get("error"):
+        line += f" | verify_error={verdict['error']}"
+    return line + f" | artifact={artifact}"
 
 
 # ---------------------------------------------------------------------------

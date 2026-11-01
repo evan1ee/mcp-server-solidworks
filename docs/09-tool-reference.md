@@ -56,7 +56,7 @@ All lengths are **meters**. Tool angles are **degrees** except `modify_dimension
 | Tool | Route | Purpose / key params |
 |---|---|---|
 | `verify_state` | E·ro | Current CadState |
-| `analyze_model` | E·ro | mass_properties\|geometry\|bodies\|edges\|faces\|features\|sketch\|feature_map; `near`/`k`/`axis` narrow face/edge reads. Face/edge **indices** from here feed other tools. |
+| `analyze_model` | E·ro | mass_properties\|geometry\|bodies\|edges\|faces\|features\|sketch\|feature_map\|brep; `near`/`k`/`axis` narrow face/edge reads. Face/edge **indices** from here feed other tools. `brep` = full single-body B-rep (surface params, outward normals, edge curve data, adjacent faces, convexity) for `convert_to_features`; slow (~0.15–0.3 s per face/edge over COM). |
 | `get_selection` | E·ro | What the user selected in the GUI, mapped to analyze indices |
 | `analyze_slddrw_test` | E·ro | Native `.slddrw` reader — test/reference only |
 
@@ -91,6 +91,7 @@ All lengths are **meters**. Tool angles are **degrees** except `modify_dimension
 | `compare_parts` | A | Topology + volume/area diff → `verified_criteria` PASS/FAIL; `detail='faces'` lists unmatched faces |
 | `compare_assemblies` | A | Component set, transforms, mates, mass diff |
 | `analyze_drawing` | A + C | DXF/DWG reader; `mode` auto\|ir\|build ([07](07-drawing-reader.md)) |
+| `convert_to_features` | A + C | STEP/IGES or history-less `.sldprt` → feature-based part: `analyze_model(brep)` → `cad-planner/recognition` → `_run_graph` → save → verify (rebuild re-imported via STEP vs the original). `COMPLETED \| VERIFIED\|UNVERIFIED` or `FAILED \| HAS_HISTORY\|MULTIBODY\|NOT_AXIS_ALIGNED\|UNSUPPORTED_GEOMETRY\|…`; never modifies the input ([08](08-analysis-and-verification.md#step--feature-based-part)) |
 
 ## Resources
 

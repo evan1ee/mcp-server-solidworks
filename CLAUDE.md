@@ -104,6 +104,8 @@ pip install -r adapters/claude/requirements-dev.txt
 (cd compiler/solidworks && python -m pycompiler.tests.test_ir_schema_contract)     # IR schema contract
 (cd compiler/solidworks && python -m pycompiler.tests.test_compiler)               # compiler tests
 (cd cad-planner/drawing && python -m tests.test_draw_contract)                     # drawing contract
+python cad-planner/recognition/tests/test_recognition.py                            # STEP→features recognizer
+(cd adapters/claude && python tests/test_convert_features.py)                       # convert_to_features orchestration
 pytest compiler/solidworks/pycompiler/tests/test_compiler.py::test_sketch_extrude_boss_path   # single test
 ```
 
