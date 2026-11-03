@@ -789,8 +789,9 @@ def auto_center_marks(
     include_slots: also add slot center marks/centerlines for linear & arc slots (not just round holes). Default True.
     extended_lines: draw the extended centerlines through each hole rather than a small cross. Default True.
 
-    Returns COMPLETED with result_geometry.center_marks (total marks placed across all views; 0 if the
-    part has no holes/slots). Bumps state_version. Requires an active drawing with model views."""
+    Returns COMPLETED with result_geometry.center_marks (total marks now on all views; 0 if the
+    part has no holes/slots) and center_marks_added (how many this call added). A hole that already
+    has a mark keeps exactly one (stacked copies are deleted, counted in duplicates_removed). Bumps state_version. Requires an active drawing with model views."""
     return _call(
         "auto_center_marks",
         {"include_slots": include_slots, "extended_lines": extended_lines},

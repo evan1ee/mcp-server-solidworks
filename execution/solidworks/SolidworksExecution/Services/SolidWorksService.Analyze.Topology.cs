@@ -353,7 +353,11 @@ namespace SolidworksExecution.Services
             // itself, and live on 4-1 EditRollback(ToAfterFeature, "Sheet-Metal1") JUMPED THE BAR TO
             // THE END (the stop showed the full final body and Base-Flange1 then diffed NEGATIVE).
             // Skipping it attributes the blank correctly to SMBaseFlange.
-            "SheetMetal"
+            "SheetMetal",
+            // Template "Tables" folder and its "Configuration Table" child (live type names, SW 2026
+            // part template): no geometry, and EditRollback(BeforeFeature, "Tables") returns false —
+            // as the first stop it failed the whole map with ROLLBACK_FAILED.
+            "ConfigTableFolder", "NativeConfigurationTableFeature"
         };
 
         // 1µm — a rollback stop REPLAYS the same history, so surviving geometry matches to double

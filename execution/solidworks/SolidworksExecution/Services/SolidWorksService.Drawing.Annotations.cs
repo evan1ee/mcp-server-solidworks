@@ -109,6 +109,11 @@ namespace SolidworksExecution.Services
 
                 int viewsProcessed = 0;
                 int viewsMarked = 0;
+                // Marks already present (the "auto insert center marks" document option adds them when
+                // a view is created). AutoInsertCenterMarks2 does not skip those holes — it stacks a
+                // second mark — so stacked copies are removed afterwards and the delta is what THIS
+                // call actually added.
+                int marksBefore = 0;
                 var modelViews = new List<IView>();
                 object viewObj = drawingDoc.GetFirstView(); // first view = the sheet
                 int guardCounter = 0;
@@ -123,6 +128,7 @@ namespace SolidworksExecution.Services
                         if (vType != 1)
                         {
                             modelViews.Add(view);
+                            marksBefore += CountCenterMarks(view);
                             bool ok = false;
                             // Many drawing annotation ops act on the ACTIVE view — activate it first.
                             try { drawingDoc.ActivateView(view.Name); } catch { }
@@ -148,19 +154,29 @@ namespace SolidworksExecution.Services
                 // Commit so the inserted center marks/centerlines are realized (and so the per-view
                 // counters below are not stale — this interop's GetCenterMarkCount can read 0 pre-rebuild).
                 try { modelDoc.EditRebuild3(); } catch { }
+
+                int duplicatesRemoved = 0;
+                foreach (var v in modelViews)
+                    duplicatesRemoved += RemoveStackedCenterMarks(modelDoc, v);
+                if (duplicatesRemoved > 0)
+                    try { modelDoc.EditRebuild3(); } catch { }
                 modelDoc.GraphicsRedraw2();
 
-                // views_marked (the API success count) is the RELIABLE in-band signal that center marks
-                // were auto-inserted; the raw mark/line counts are best-effort (this interop under-reports
-                // them — verified visually that marks ARE present even when these read 0).
-                int totalMarks = 0, totalLines = 0;
+                // Count by walking the annotation chains: GetCenterMarkCount/GetCenterLineCount read 0
+                // here even though the marks exist (DXF had the SW_CENTERMARKSYMBOL blocks), whereas the
+                // GetFirstCenterMark/GetNext walk — the same one analyze_slddrw_test reads — sees them.
+                int totalMarks = 0, totalLines = 0, apiMarks = 0;
                 foreach (var v in modelViews)
                 {
-                    try { totalMarks += v.GetCenterMarkCount(); } catch { }
-                    try { totalLines += v.GetCenterLineCount(); } catch { }
+                    totalMarks += CountCenterMarks(v);
+                    totalLines += CountCenterLines(v);
+                    try { apiMarks += v.GetCenterMarkCount(); } catch { }
                 }
+                int marksAdded = Math.Max(0, totalMarks - marksBefore);
 
-                ExecLog.Write($"auto_center_marks: views_marked={viewsMarked}/{viewsProcessed} marks={totalMarks} lines={totalLines} " +
+                ExecLog.Write($"auto_center_marks: views_marked={viewsMarked}/{viewsProcessed} marks={totalMarks} " +
+                    $"(before={marksBefore} added={marksAdded} duplicates_removed={duplicatesRemoved} " +
+                    $"GetCenterMarkCount={apiMarks}) lines={totalLines} " +
                     $"includeSlots={includeSlots} extendedLines={extendedLines}");
 
                 return BuildCompletedResponse(
@@ -171,11 +187,89 @@ namespace SolidworksExecution.Services
                     {
                         ["views_marked"] = viewsMarked,
                         ["views_processed"] = viewsProcessed,
-                        ["center_marks"] = totalMarks,   // best-effort (interop under-reports; marks ARE present)
-                        ["center_lines"] = totalLines,   // best-effort
+                        ["center_marks"] = totalMarks,          // marks now on the model views
+                        ["center_marks_added"] = marksAdded,    // inserted by this call
+                        ["duplicates_removed"] = duplicatesRemoved, // stacked marks deleted
+                        ["center_lines"] = totalLines,
                         ["include_slots"] = includeSlots
                     });
             });
+        }
+
+        // Center marks in a view, one per marked hole: a grouped mark (pattern) counts its GroupCount.
+        private static int CountCenterMarks(IView view)
+        {
+            int count = 0, guard = 0;
+            object cmObj = null;
+            try { cmObj = view.GetFirstCenterMark(); } catch { return 0; }
+            while (cmObj is ICenterMark cm && guard++ < 500)
+            {
+                int members = 1;
+                try { if (cm.IsGrouped) members = Math.Max(1, cm.GroupCount); } catch { }
+                count += members;
+                try { cmObj = cm.GetNext(); } catch { cmObj = null; }
+            }
+            return count;
+        }
+
+        // Delete center marks stacked on the same hole(s) as an earlier mark in the view's chain (the
+        // first one — normally the pre-existing mark — is kept). Positions are view-space mark centres
+        // (ICenterMark.GetPosition, see ReadCenterMarks). Returns the number deleted.
+        private static int RemoveStackedCenterMarks(IModelDoc2 modelDoc, IView view)
+        {
+            var seen = new HashSet<string>();
+            var stacked = new List<ICenterMark>();
+            object cmObj = null;
+            try { cmObj = view.GetFirstCenterMark(); } catch { return 0; }
+            int guard = 0;
+            while (cmObj is ICenterMark cm && guard++ < 500)
+            {
+                string key = CenterMarkKey(cm);
+                if (key != null && !seen.Add(key)) stacked.Add(cm);
+                try { cmObj = cm.GetNext(); } catch { cmObj = null; }
+            }
+            if (stacked.Count == 0) return 0;
+
+            modelDoc.ClearSelection2(true);
+            int selected = 0;
+            foreach (var cm in stacked)
+                try { if (cm.Select(true, null)) selected++; } catch { }
+            if (selected > 0) modelDoc.EditDelete();
+            modelDoc.ClearSelection2(true);
+            ExecLog.Write($"auto_center_marks: view '{view.Name}' stacked={stacked.Count} deleted={selected}");
+            return selected;
+        }
+
+        // Identity of a mark = its centre position(s) on a 1e-5 m grid (all members for a grouped mark).
+        private static string CenterMarkKey(ICenterMark cm)
+        {
+            int members = 1;
+            try { if (cm.IsGrouped) members = Math.Max(1, cm.GroupCount); } catch { }
+            var parts = new List<string>();
+            for (int i = 0; i < members && i < 100; i++)
+            {
+                double[] p = null;
+                try { p = ToDoubleArray(cm.GetPosition(i)); } catch { }
+                if (p == null || p.Length < 2) return null;
+                parts.Add($"{Math.Round(p[0], 5):R},{Math.Round(p[1], 5):R}");
+            }
+            parts.Sort(StringComparer.Ordinal);
+            return string.Join(";", parts);
+        }
+
+        // Centerline annotations in a view (the extended lines of a center mark are NOT separate
+        // centerlines — they belong to the mark).
+        private static int CountCenterLines(IView view)
+        {
+            int count = 0, guard = 0;
+            object clObj = null;
+            try { clObj = view.GetFirstCenterLine(); } catch { return 0; }
+            while (clObj is ICenterLine cl && guard++ < 500)
+            {
+                count++;
+                try { clObj = cl.GetNext(); } catch { clObj = null; }
+            }
+            return count;
         }
 
         // add_hole_callout — insert a hole callout (e.g. "n× ØD THRU") on the hole edge nearest the sheet

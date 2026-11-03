@@ -248,7 +248,7 @@
     "extended_lines": "boolean (optional, default true — draw the extended centerlines through each hole, not just a small cross)"
    }
   },
-  "output": "→ see execution-response.json — result_geometry holds {center_marks, views_processed, include_slots}. center_marks = total center marks across all model views (0 if the part has no holes/slots)."
+  "output": "→ see execution-response.json — result_geometry holds {center_marks, center_marks_added, duplicates_removed, center_lines, views_marked, views_processed, include_slots}. center_marks = total center marks now on all model views (0 if the part has no holes/slots); center_marks_added = how many this call added; duplicates_removed = marks stacked on an already-marked hole that were deleted (holes marked at view creation keep their single mark)."
  },
  "add_hole_callout": {
   "description": "Inserts a hole callout (e.g. 'n× ØD THRU') on the hole edge nearest the sheet point (px, py) in the active drawing, via IDrawingDoc.AddHoleCallout2. Coordinate-based — same fragile point pick as add_drawing_dimension (KNOWN-LIMITATIONS #6); prefer auto_center_marks for centerlines and use this for explicit per-hole callouts. Bumps state_version. Requires an active drawing.",
