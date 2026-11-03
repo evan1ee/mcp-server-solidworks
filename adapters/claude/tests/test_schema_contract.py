@@ -62,6 +62,20 @@ def _contract_tools():
     return out
 
 
+
+def _read_adapter_sources() -> str:
+    """Read all production python code under adapters/claude (server.py and tools/*.py)."""
+    sources = []
+    for root, _, files in os.walk(_ADAPTER_DIR):
+        if "tests" in root:
+            continue
+        for f in files:
+            if f.endswith(".py"):
+                with open(os.path.join(root, f), encoding="utf-8") as fh:
+                    sources.append(fh.read())
+    return "\n".join(sources)
+
+
 def find_drift():
     """Return a list of human-readable drift messages (empty == in sync)."""
     adapter = _adapter_tools()
@@ -110,8 +124,7 @@ def find_resource_drift():
 
     # 3. THE IMPORTANT ONE: every recipe://|schema:// URI mentioned anywhere in server.py must
     #    resolve, or the docstring pointers silently stop finding the rules.
-    with open(os.path.join(_ADAPTER_DIR, "server.py"), encoding="utf-8") as fh:
-        source = fh.read()
+    source = _read_adapter_sources()
     mentioned = set(re.findall(r"(?:recipe|schema)://[A-Za-z0-9_./{}-]+", source))
     prefixes = [t.split("{")[0] for t in templates if "{" in t]
     for uri in sorted(mentioned):
@@ -138,8 +151,7 @@ def find_drawing_api_drift():
     cost the user a reconnect. Cheap to check, so check it.
     """
     errors = []
-    with open(server.__file__, encoding="utf-8") as fh:
-        src = fh.read()
+    src = _read_adapter_sources()
     used = set(re.findall(r"_draw\.([A-Za-z_][A-Za-z0-9_]*)", src))
     if server._draw is None:
         return ["the drawing package did not import — cannot verify the _draw API surface"]
