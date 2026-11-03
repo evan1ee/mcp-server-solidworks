@@ -25,6 +25,7 @@ from recipes import (
     format_get_recipe as _format_get_recipe,
     format_recipe_index_resource as _format_recipe_index_resource,
 )
+from dimension_plan import plan_dimensions, execute_plan
 from drawing_pipeline import (
     summarise_direct as _summarise_direct,
     advisories as _advisories,
@@ -740,6 +741,86 @@ def add_drawing_dimension(
         {"px": px, "py": py, "value": value, "label_offset_x": label_offset_x,
             "label_offset_y": label_offset_y},
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool: add_drawing_dimension_ex
+# ---------------------------------------------------------------------------
+@mcp.tool(structured_output=False)
+def add_drawing_dimension_ex(
+    x1: float,
+    y1: float,
+    text_x: float,
+    text_y: float,
+    x2: Optional[float] = None,
+    y2: Optional[float] = None,
+    orientation: Literal["auto", "horizontal", "vertical", "aligned"] = "auto",
+    arc_condition: Literal["center", "min", "max"] = "center",
+    expected_value: Optional[float] = None,
+    prefix: str = "",
+    suffix: str = "",
+    precision: int = -1,
+    measure_only: bool = False,
+) -> str:
+    """Add a VERIFIED two-pick dimension to the active drawing. Picks the projected edge nearest (x1,y1)
+    and, if given, the one nearest (x2,y2) (sheet meters), dimensions between them (horizontal / vertical
+    / aligned / auto) and places the text at (text_x,text_y). Two circle picks measure center-to-center
+    by default (hole pitch, bolt circle); use arc_condition min/max for edge-to-edge. One circle pick
+    (omit x2,y2) gives a diameter.
+    expected_value: the value you expect in METERS; if the measured value differs by > 1e-6 m the
+    dimension is deleted and the call fails (DIMENSION_VALUE_MISMATCH) — always pass it.
+    prefix: dimension text prefix such as '4×Ø' (replaces the automatic Ø). suffix: e.g. ' THRU'. precision: displayed decimal places (-1 = default).
+    measure_only: create and verify the dimension, then delete it (nothing stays on the sheet); the value is
+    returned in result_geometry.measured_value. Use for values written elsewhere, e.g. a bolt-circle diameter in a hole callout.
+    Requires an active drawing document. Bumps state_version."""
+    params: dict = {"x1": x1, "y1": y1, "text_x": text_x, "text_y": text_y,
+                    "orientation": orientation, "arc_condition": arc_condition,
+                    "prefix": prefix, "suffix": suffix, "precision": precision}
+    if x2 is not None and y2 is not None:
+        params.update({"x2": x2, "y2": y2})
+    if expected_value is not None:
+        params["expected_value"] = expected_value
+    if measure_only:
+        params["measure_only"] = True
+    return _call("add_drawing_dimension_ex", params)
+
+
+# ---------------------------------------------------------------------------
+# Tool: move_drawing_dimension
+# ---------------------------------------------------------------------------
+@mcp.tool(structured_output=False)
+def move_drawing_dimension(name: str, x: float, y: float) -> str:
+    """Move an existing drawing dimension's text to sheet position (x, y) in METERS; the dimension and
+    extension lines follow. name is the full dimension name returned by add_drawing_dimension_ex
+    (e.g. 'D1@Drawing View1'). Use it to fix crossing dimensions after placement (swap nested tiers).
+    Returns the before/after position. Requires an active drawing document. Bumps state_version."""
+    return _call("move_drawing_dimension", {"name": name, "x": x, "y": y})
+
+
+# ---------------------------------------------------------------------------
+# Tool: dimension_drawing
+# ---------------------------------------------------------------------------
+@mcp.tool(structured_output=False)
+def dimension_drawing(
+    facts_json: str,
+    views_json: str,
+    dry_run: bool = False,
+) -> str:
+    """Fully dimension an IR-built part's drawing views (strategy 'full'): overall size, hole pitch,
+    bolt circle, hole callouts with count prefix, boss/bore diameters and the depth profile — with
+    non-overlapping offset tiers, no cross-view duplicates, every value verified against the model
+    (add_drawing_dimension_ex expected_value). Call AFTER add_drawing_view for the views.
+
+    facts_json: JSON {"width","height" (m), "boss":{"diameter"}, "bore":{"diameter"},
+      "hole_groups":[{"role":"mount"|"pcd","diameter","centers":[[x,y]..]}],
+      "depth":{"total","flange","boss","boss_width"}} — front-view-local meters from analyze_model.
+    views_json: JSON {"front":{"pos":[x,y],"scale":s},"top":{"pos":[x,y],"scale":s}} where pos is the
+      sheet position of each view's bounding-box center (as reported by analyze_slddrw_test).
+    dry_run: return the planned dimension calls without creating anything."""
+    plan = plan_dimensions(json.loads(facts_json), json.loads(views_json))
+    if dry_run:
+        return json.dumps(plan, ensure_ascii=False)
+    return json.dumps(execute_plan(plan, _call), ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------

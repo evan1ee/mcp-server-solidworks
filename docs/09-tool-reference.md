@@ -111,3 +111,9 @@ All lengths are **meters**. Tool angles are **degrees** except `modify_dimension
 - Replay: `DUPLICATE | operation already executed | last_known_state_version=N`
 - Forwarded failure: raised as an MCP error, `CAD operation failed | code=<CODE> | message=…`
 - Adapter-only failure: returned as text, `FAILED | <CODE> | <detail>`
+
+## `add_drawing_dimension_ex` and `dimension_drawing`
+
+`add_drawing_dimension_ex` picks one or two projected edges by sheet point (`x1,y1[,x2,y2]`), creates a horizontal / vertical / auto dimension at `text_x,text_y`, reads the measured value back and, when `expected_value` (meters) differs by more than 1e-6 m, deletes the dimension and fails with `DIMENSION_VALUE_MISMATCH`. Two circle picks measure center-to-center (`arc_condition=center`), which gives hole pitch and bolt-circle diameter. `prefix` replaces the default text prefix (so a diameter callout needs `4×Ø`, not `4×`). Unlike `add_drawing_dimension`, whose `value` write to a reference dimension is silently ignored, nothing here is accepted unverified.
+
+`dimension_drawing(facts_json, views_json, dry_run)` (adapter-only) runs `dimension_plan.py` and places the whole set; failures are reported, not raised. The result also lists `measured_only` (verified then removed, e.g. the bolt circle), `crossings` and `unavoidable` layout findings. `add_drawing_dimension_ex(measure_only=true)` creates, verifies and deletes the dimension and returns `result_geometry.measured_value`. View `pos` is the sheet position of the view's bounding-box center.

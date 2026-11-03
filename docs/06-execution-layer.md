@@ -131,3 +131,7 @@ Naming trap: the C# method `AnalyzeDrawing` is the old native-SLDDRW reader, exp
 - CI can't build this layer (it needs the licensed interop assemblies). C# changes are verified live.
 
 Build and restart commands: [10-development.md](10-development.md).
+
+### Two-pick drawing dimensions (live-verified 2026-11-03)
+
+`AddHorizontalDimension2` / `AddVerticalDimension2` / `AddDimension2` on two selected circle edges measure center-to-center by default; `IDimension.SetArcEndCondition` (1=center, 2=min, 3=max) is applied for explicit control. `IDisplayDimension.SetText(1, prefix)` replaces the text prefix including the automatic Ø. The measured value is read with `GetSystemValue3`; `SystemValue` is read-only on drawing reference dimensions.

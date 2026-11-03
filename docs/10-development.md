@@ -23,6 +23,7 @@ That file pulls the runtime requirements (`mcp`, `httpx`, `python-dotenv`, `ezdx
 | Drawing reader | `cd cad-planner/drawing && python -m tests.test_draw_contract` | dialect drift, chaining/pairing/gate goldens, IR validity |
 | STEP recognizer | `python cad-planner/recognition/tests/test_recognition.py` | blends, classification, prismatic/turned decomposition, IR validity on recorded STEP-import fixtures |
 | Convert tool | `cd adapters/claude && python tests/test_convert_features.py` | `convert_to_features` orchestration (history guard, drop-and-continue, labels, artifact) with SolidWorks faked |
+| Dimension planner | `pytest adapters/claude/tests/test_dimension_plan.py` | `dimension_plan.py`: deterministic plan, expected values, count prefixes, offset tiers, no cross-view duplicates |
 | Adapter modules | `pytest adapters/claude/tests/test_mcp_surface_regression.py` | extracted adapter modules (state helpers, recipes, drawing formatting, `save_analysis`, `compare_*`, IR doors) and the `_call` state-version resync, with SolidWorks faked |
 
 Each also runs under pytest, e.g. `pytest compiler/solidworks/pycompiler/tests/test_compiler.py::test_sketch_extrude_boss_path`. The standalone runners print `ok`/`FAIL` per test and exit non-zero on failure.
@@ -32,6 +33,7 @@ Each also runs under pytest, e.g. `pytest compiler/solidworks/pycompiler/tests/t
 | Edited path | Suites re-run |
 |---|---|
 | `adapters/claude/` | tool contract, convert tool |
+| `adapters/claude/dimension_plan.py`, `tests/test_dimension_plan.py` | dimension planner (in addition to the row above) |
 | `tool-schemas.json`, `recipe-usage.md` | tool contract |
 | `compiler/solidworks/pycompiler/` | IR contract, compiler, drawing |
 | `feature-graph.schema.json` | IR contract, drawing |

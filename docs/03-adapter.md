@@ -118,3 +118,7 @@ Unknown slugs raise `ResourceError` (other exceptions get their message replaced
 - **Optional indices use `-1` sentinels** (`face_index`, `up_to_face_index`, `fixed_face_index`, `edge_index`); the wrapper sends them only when `>= 0`.
 - Model-facing constraints belong here (`Literal`, Pydantic `Field`) — the model never sees `tool-schemas.json`.
 - Some wrong inputs fail *silently*: `arc_center` with the wrong `direction` draws the complementary arc; extrude `reverse` and sheet-metal thickening direction don't show up in volume/area/topology. The recipe documents these.
+
+### `dimension_plan.py`
+
+Pure planner for `dimension_drawing`: part facts + view placement -> ordered `add_drawing_dimension_ex` calls with extent-based offset tiers (`assign_tiers`: enclosed spans go inner, disjoint spans share a tier), leader routing from alternatives, `measure_only` bolt circles folded into the hole callout (`ON Ø24 PCD`), `check_crossings` layout check and no cross-view duplicates; `execute_plan` runs it through a `call` callable passed in by `server.py`. Tests: `adapters/claude/tests/test_dimension_plan.py`.
