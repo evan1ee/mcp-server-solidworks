@@ -59,11 +59,7 @@ from tools.assembly import register_assembly_tools
 from tools.drawings import register_drawing_tools
 from tools.inspection import register_inspection_tools, _draw
 from tools.ir_doors import register_ir_doors
-from tools.resources import (
-    register_resources,
-    _RECIPE_SECTIONS,
-    _recipe_sections,
-)
+from tools.resources import register_resources
 from feature_conversion import (
     _RecognitionView,
     recognize_brep as _recognize_brep_impl,
@@ -221,41 +217,26 @@ _assembly_tools = register_assembly_tools(mcp, _call)
 globals().update(_assembly_tools)
 _drawing_tools = register_drawing_tools(mcp, _call)
 globals().update(_drawing_tools)
-_inspection_tools = register_inspection_tools(mcp, _call, _call_raw, _run_graph)
+_inspection_tools = register_inspection_tools(
+    mcp,
+    _call,
+    lambda *a, **k: _call_raw(*a, **k),
+    lambda *a, **k: _run_graph(*a, **k),
+)
 globals().update(_inspection_tools)
 
 
-# ---------------------------------------------------------------------------
-# RESOURCE surface: the IR-generation recipe + the two cad-planner contract JSONs
-#
-# These were the `get_recipe(section=...)` tool until 2026-07-30 (ADR-069). They are now MCP
-# *resources*: the content is large, near-static, identical for every caller and re-read
-# constantly — exactly what `resources/read` + the 2026-07-28 `ttlMs`/`cacheScope` hints are for.
-# MEASURED reason to move (not estimated): `get_recipe` cost 2,369 chars of `tools/list` on EVERY
-# turn (2.97% of the 47-tool surface; 1,928 of it the docstring), paid whether or not any recipe
-# was read. A resource read costs ~50 chars MORE than the equivalent tool result (the
-# `uri`+`mimeType` wrapper), so the win is entirely the per-turn surface — which is why the tool
-# had to GO, not sit beside the resources.
-#
-# Shape decided with the user (2026-07-30):
-#   - EVERY section is its own STATIC resource. Probe finding: templated URIs are readable but
-#     appear in NO listing (`resources/list` shows static entries only), so a template-only
-#     surface would be undiscoverable. Static-per-section makes ONE `resources/list` the manifest.
-#   - `recipe://usage/{section}` stays as a TEMPLATE ALIAS so a slug guessed from the index
-#     still resolves. Concrete resources win over templates in the SDK's resolution order, so
-#     the static entries above are never shadowed by it.
-#   - Version lives in the BODY only (`Version: 0.21.0`), never in the URI: bumps must not
-#     break the URI pointers embedded in the tool docstrings below.
-#   - The FROZEN `slddrw-testing-recipe-usage.md` pair (ADR-063) is deliberately NOT served —
-#     it stays a repo file; port from it consciously if a rule there is wanted again.
-# The recipe's PRIVATE full edition (`recipe.md`) is NEVER served — it carries lesson history and
-# provenance, is gitignored, and only the PUBLIC `-usage` twin appears on this surface.
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # IR Doors & MCP Resources Registration
 # ---------------------------------------------------------------------------
-_ir_tools = register_ir_doors(mcp, _call_raw, _run_graph, _compare_docs, _recognize_brep)
+_ir_tools = register_ir_doors(
+    mcp,
+    lambda *a, **k: _call_raw(*a, **k),
+    lambda *a, **k: _run_graph(*a, **k),
+    lambda *a, **k: _compare_docs(*a, **k),
+    lambda *a, **k: _recognize_brep(*a, **k),
+)
 globals().update(_ir_tools)
 register_resources(mcp)
 

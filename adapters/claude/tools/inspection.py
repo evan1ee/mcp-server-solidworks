@@ -139,34 +139,6 @@ def analyze_model(
 # ---------------------------------------------------------------------------
 # Tool: analyze_drawing  (2026-07-27 — the SHIPPING drawing reader: DXF/DWG)
 # ---------------------------------------------------------------------------
-# The reader is a permanent module of the CAD-neutral planner layer (ADR-064): a drawing is design
-# intent expressed in 2D, so it belongs beside the IR schema and the recipe, not in a research dir.
-_CAD_PLANNER_PKG_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
-
-# Imported EAGERLY, at startup, in the MAIN thread -- deliberately, and NOT lazily inside the tool
-# like pycompiler is. ezdxf pulls in numpy, and loading numpy's C extensions from an MCP worker
-# thread DEADLOCKS on Windows: the tool hung forever with no error and no traceback (diagnosed by
-# faulthandler thread dump, 2026-07-27 -- stuck in importlib create_module for numpy._core.
-# multiarray). A failure here must still never kill the server, so it degrades to a clean per-call
-# error instead.
-try:
-    if _CAD_PLANNER_PKG_DIR not in sys.path:
-        sys.path.insert(0, _CAD_PLANNER_PKG_DIR)
-    import drawing as _draw
-    _DXF_READER_IMPORT_ERROR = None
-except Exception as _exc:                     # noqa: BLE001 - startup must survive anything
-    _draw = None
-    _DXF_READER_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc} (pip install ezdxf)"
-
-# The STEP→features recognizer (cad-planner/recognition): stdlib-only, so a plain import — kept next
-# to `drawing` and equally non-fatal.
-try:
-    import recognition as _recognition
-    _RECOGNITION_IMPORT_ERROR = None
-except Exception as _exc:                     # noqa: BLE001 - startup must survive anything
-    _recognition = None
-    _RECOGNITION_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
 def analyze_drawing(file_path: str, save_analysis: bool = True,

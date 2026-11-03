@@ -24,24 +24,6 @@ _run_graph: Optional[Callable] = None
 _compare_docs: Optional[Callable] = None
 _recognize_brep: Optional[Callable] = None
 
-import sys
-
-def _get_call_raw():
-    srv = sys.modules.get("server")
-    return getattr(srv, "_call_raw", _call_raw)
-
-def _get_run_graph():
-    srv = sys.modules.get("server")
-    return getattr(srv, "_run_graph", _run_graph)
-
-def _get_compare_docs():
-    srv = sys.modules.get("server")
-    return getattr(srv, "_compare_docs", _compare_docs)
-
-def _get_recognize_brep():
-    srv = sys.modules.get("server")
-    return getattr(srv, "_recognize_brep", _recognize_brep)
-
 # Tool: get_recipe  (RESTORED 2026-09-03, ADR-077 — reverses ADR-069's retirement)
 # ---------------------------------------------------------------------------
 # ADR-069 moved the recipe from a TOOL to 13 MCP resources on a measured saving of 2,146 chars of
@@ -103,7 +85,7 @@ def get_recipe(
 
 
 def _save_assembly_analysis(src: str, sha: str) -> str:
-    return _save_assembly_analysis_impl(src, sha, _get_call_raw())
+    return _save_assembly_analysis_impl(src, sha, _call_raw)
 
 
 def save_analysis(file_path: str) -> str:
@@ -125,7 +107,7 @@ def save_analysis(file_path: str) -> str:
         entity anchors) + assembly mass properties.
     Returns a token-frugal summary (artifact path + counts) — the artifact JSON stays on disk;
     read it from there when the full content is needed."""
-    return _run_save_analysis(file_path, _get_call_raw())
+    return _run_save_analysis(file_path, _call_raw)
 
 # ---------------------------------------------------------------------------
 # Tool: rebuild_from_ir  (adapter-only — the analysis pipeline's IR door, IR-ADR-005)
@@ -149,7 +131,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
     with compare_parts and only then label the artifact's ir.verification. If you are GENERATING
     the ir.graph yourself, read the MCP resource `recipe://usage/index` first — it indexes the
     mapping/canonicalization rules the compiler expects."""
-    return _run_rebuild_from_ir(artifact_path, fresh_document, _get_run_graph())
+    return _run_rebuild_from_ir(artifact_path, fresh_document, _run_graph)
 
 # ---------------------------------------------------------------------------
 # Tool: compare_parts  (adapter-only — the objective round-trip verifier, ADR-040/A0)
@@ -175,7 +157,7 @@ def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
         point-query can't do — it turns "which face did my rebuild add/drop?" into one call instead
         of manually pairing two full face lists. Faces are reported with their key attributes + the
         stable index `i` in their own document."""
-    return _run_compare_parts(doc_a, doc_b, detail, _get_compare_docs())
+    return _run_compare_parts(doc_a, doc_b, detail, _compare_docs)
 
 
 
@@ -194,7 +176,7 @@ def compare_assemblies(doc_a: str, doc_b: str) -> str:
     Components are paired by (source basename, instance ordinal in tree order) — instance
     numbering may legitimately differ between original and rebuild. The verdict is a REPORT;
     writing ir.verification into the artifact stays the caller's job. doc_b is left active."""
-    return _run_compare_assemblies(doc_a, doc_b, _get_call_raw())
+    return _run_compare_assemblies(doc_a, doc_b, _call_raw)
 
 # ---------------------------------------------------------------------------
 # Tool: submit_feature_graph  (the FORWARD IR door — intent → IR → pycompiler → SolidWorks.
@@ -238,7 +220,7 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     (reported, never hidden). The adapter resyncs state_version after every run, so subsequent
     normal tools keep working. Verify the result objectively (analyze_model / compare_parts) —
     never assume."""
-    return _run_submit_feature_graph(graph, fresh_document, _get_run_graph())
+    return _run_submit_feature_graph(graph, fresh_document, _run_graph)
 
 # ---------------------------------------------------------------------------
 # Tool: convert_to_features  (adapter-only — STEP / history-less part → feature-based part)
@@ -273,10 +255,10 @@ def convert_to_features(
         file_path,
         output_path,
         overwrite,
-        _get_call_raw(),
-        _get_run_graph(),
-        _get_compare_docs(),
-        _get_recognize_brep(),
+        _call_raw,
+        _run_graph,
+        _compare_docs,
+        _recognize_brep,
     )
 
 # ---------------------------------------------------------------------------
