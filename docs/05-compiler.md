@@ -13,6 +13,12 @@ Lowers a Feature Graph IR into ordered execution-layer tool calls and runs them.
 
 Packaged as `solidpilot-pycompiler` (`pyproject.toml`). The adapter imports it in-process (`adapters/claude/ir_execution_port.py` is the production port) and falls back to a `sys.path` insert when it isn't pip-installed. It imports nothing from the adapter, so it can be pulled out into a standalone service later.
 
+### Extension points (dispatch tables)
+
+- **Validation:** `ir_schema._NODE_VALIDATORS` maps `node.type` → `_validate_<type>(node, label, ctx, errors)`. Cross-node state (seen ids, preceding sketch, …) lives in one `_ValidationContext`, not in loose locals.
+- **Planning:** `compiler._NODE_PLANNERS` maps `node.type` → the planner that turns one node into ops (lowering + resolver calls). Step failures are recorded through one `_record_step_failure` path, so every failure produces the same `FeatureError` shape.
+- Adding a node type = vocabulary in `feature-graph.schema.json` + `ir_schema.py` frozensets (gate 3), one validator registered in `_NODE_VALIDATORS`, one lowering function, one planner registered in `_NODE_PLANNERS`, tests. No other node's code changes.
+
 ## Pipeline
 
 ```

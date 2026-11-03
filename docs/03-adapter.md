@@ -4,7 +4,14 @@ The adapter is the MCP server the AI client launches. It translates tool calls t
 
 | File | Role |
 |---|---|
-| `server.py` (~2.7k lines) | The whole MCP surface: 47 tools, 13 resources + 1 template, and the adapter-side orchestration (`save_analysis`, `compare_*`, `rebuild_from_ir`, `submit_feature_graph`, `analyze_drawing`, `get_recipe`). |
+| `server.py` (~2.0k lines) | The whole MCP **surface**: every `@mcp.tool` / `@mcp.resource` definition (names, docstrings, type hints = the contract), `_state_version` and the `_call` / `_call_raw` transport wrappers. Orchestration tools are thin: they delegate to the modules below, passing `_call_raw` / `_run_graph` / `_compare_docs` in as callables. |
+| `state_manager.py` | Pure helpers: operation ids, `is_state_mismatch`, `analysis_items`, `kv_dict` (comma-decimal tolerant), `delta_pct`. |
+| `recipes.py` | `recipe-usage.md` section parsing, contract-JSON loading, the served (trimmed) feature-graph schema, `get_recipe` / `recipe://usage/index` bodies. |
+| `analysis_pipeline.py` | `save_analysis` for `.SLDPRT` / `.SLDASM` (artifact writing, parameter lifting). |
+| `comparison.py` | `compare_parts` / `compare_assemblies` and the face-diff matcher (`compare_docs` is shared with `convert_to_features`). |
+| `drawing_pipeline.py` | `analyze_drawing` result formatting: direct-build summary, advisories, compact wire JSON, build tail. The `_draw.*` reader calls stay in `server.py` (the contract test scans them there). |
+| `ir_runner.py` | `run_graph` — the ONE path from a Feature Graph to geometry — plus the `rebuild_from_ir` / `submit_feature_graph` bodies. |
+| `feature_conversion.py` | `convert_to_features` orchestration: history guard, recognition view, drop-and-continue build, STEP re-import verification, artifact. |
 | `execution_client.py` | Sync `httpx` REST client to the C# server: auto-start, timeouts, `/health` probe, logging. |
 | `ir_execution_port.py` | `AdapterExecutionPort` — the production `ExecutionPort` that lets `pycompiler` drive the execution layer; `run_feature_graph(graph)`. |
 | `response_mapper.py` | `ExecutionResponse` dict → compact result string (or raise on `FAILED`). |
@@ -94,6 +101,12 @@ Unknown slugs raise `ResourceError` (other exceptions get their message replaced
 - **Tool drift** — `{tool: param names}` from `mcp.list_tools()` must equal `execution/solidworks/contracts/tool-schemas.json` (`spec.input.params`). Names only, not types. Adapter-only tools are in the JSON too.
 - **Resource drift** — every recipe slug is registered and has a header; no header goes unserved; every `recipe://` / `schema://` URI written anywhere in `server.py` (docstrings included) resolves.
 - **Drawing API drift** — every `_draw.<name>` used in `server.py` exists in `cad-planner/drawing.__all__`.
+
+`tests/test_mcp_surface_regression.py` unit-tests the extracted modules with faked `call_raw` callables (state helpers, recipe sections and schema trimming, advisories/summary formatting, `save_analysis` part + assembly artifacts, `compare_*` verdicts, IR doors, and the `_call` resync-on-`INVALID_STATE_VERSION` retry).
+
+### Dependency rule
+
+`server.py` → extracted modules → (`state_manager`, stdlib). The extracted modules never import `server.py` and never touch `_state_version`; anything stateful (`_call_raw`, `_run_graph`, `_compare_docs`, the recognizer) is **injected** as a parameter. This keeps them testable without SolidWorks and keeps `server.<name>` monkeypatch points (used by `test_convert_features.py`) effective.
 
 `tests/test_execution_client_http.py` stubs the HTTP client: `trust_env=False`, the connect-timeout floor, no bare `httpx.Client(` elsewhere, health-probe semantics, and log de-duplication.
 

@@ -151,297 +151,56 @@ def load_config():
 
 
 # --------------------------------------------------------------------------- helpers
-def _r(v, nd=3):
-    """3 decimals = 1 um in TRUE mm, the house convention (a 4th decimal bought nothing and cost
-    3% of every payload)."""
-    return round(float(v), nd)
-
-
-# Entity classes the reader consumes. Everything else it sees is COUNTED in sheet.not_read.
-_READ_TYPES = frozenset(("LINE", "ARC", "CIRCLE", "ELLIPSE", "DIMENSION", "MTEXT", "TEXT",
-                         "INSERT", "VIEWPORT"))
-
-
-def _text_of(e):
-    return (e.text if e.dxftype() == "MTEXT" else e.dxf.text) or ""
-
-
-def _walk_block(ins):
-    """Every entity inside an INSERT, nested blocks included, in WCS (ezdxf applies the insert
-    transform). A block the file does not define yields nothing."""
-    try:
-        for ve in ins.virtual_entities():
-            if ve.dxftype() == "INSERT":
-                yield from _walk_block(ve)
-            else:
-                yield ve
-    except Exception:
-        return
-
-
-def _block_rows(ins):
-    """Text inside a note block -> [(row_text, x, y)] in reading order.
-
-    A SolidWorks note block holds one MTEXT per line -- or, through the DWG route, one MTEXT per
-    GLYPH RUN (a Turkish 'AKSİ BELİRTİLMEDİĞİ' arrives as 'AKS', 'İ', 'BEL', 'İ', 'RT' ...). The
-    fragments of one row share a baseline; they are re-joined left to right, with a space only
-    where the gap after the previous fragment's estimated extent says there was one."""
-    frags = []
-    for ve in _walk_block(ins):
-        if ve.dxftype() in ("MTEXT", "TEXT"):
-            t = re.sub(r"\s+", " ", _text_of(ve).replace("\n", " ")).strip()
-            if t:
-                h = (ve.dxf.char_height if ve.dxftype() == "MTEXT" else ve.dxf.height) or 1.0
-                frags.append((t, ve.dxf.insert.x, ve.dxf.insert.y, h))
-    frags.sort(key=lambda f: (-f[2], f[1]))
-    rows = []
-    for f in frags:
-        if rows and abs(rows[-1][0][2] - f[2]) <= 0.5 * f[3]:
-            rows[-1].append(f)
-        else:
-            rows.append([f])
-    out = []
-    for row in rows:
-        row.sort(key=lambda f: f[1])
-        text, end = row[0][0], row[0][1] + 0.75 * row[0][3] * len(row[0][0])
-        for t, x, _y, h in row[1:]:
-            text += (" " if x - end > 0.35 * h else "") + t
-            end = x + 0.75 * h * len(t)
-        out.append((text, row[0][1], row[0][2]))
-    return out
-
-
-def _block_has_geometry(ins):
-    return any(ve.dxftype() not in ("MTEXT", "TEXT", "ATTRIB", "ATTDEF") for ve in _walk_block(ins))
-
-
-def ellipse_params(e):
-    """A DXF ELLIPSE -> (center, rx, ry, rot_deg, p1, p2, ccw) in PAPER mm; p1/p2 None = full.
-    Read through ezdxf's construction tool so a flipped extrusion cannot mirror the arc: the
-    endpoints and a mid-arc sample are taken in WCS, and the sweep sense is measured from them."""
-    ct = e.construction_tool()
-    maj = ct.major_axis
-    rx = math.hypot(maj.x, maj.y)
-    ry = rx * float(ct.ratio)
-    rot = math.degrees(math.atan2(maj.y, maj.x)) % 180.0
-    c = (float(ct.center.x), float(ct.center.y))
-    s, en = float(ct.start_param), float(ct.end_param)
-    span = (en - s) % (2.0 * math.pi)
-    if span < 1e-9:
-        return c, rx, ry, rot, None, None, True
-    p1, p2, pm = [(float(v.x), float(v.y)) for v in ct.vertices([s, en, s + span / 2.0])]
-    el = (c[0], c[1], rx, ry, rot)
-    t1, t2, tm = (curvefit.param_of(p, el) for p in (p1, p2, pm))
-    two_pi = 2.0 * math.pi
-    ccw = ((tm - t1) % two_pi) <= ((t2 - t1) % two_pi)
-    return c, rx, ry, rot, p1, p2, ccw
-
-
-def edge_class(doc, e):
-    """Entity linetype with BYLAYER resolved -> a closed class enum. This is the DXF replacement
-    for the SLDDRW reader's GetPolylines7 display-block discriminator."""
-    lt = getattr(e.dxf, "linetype", "BYLAYER") or "BYLAYER"
-    if lt.upper() == "BYLAYER":
-        try:
-            lt = doc.layers.get(e.dxf.layer).dxf.linetype
-        except Exception:
-            lt = "Continuous"
-    u = lt.upper()
-    if u.startswith("HIDDEN"):
-        return "hidden"
-    if u.startswith("PHANTOM"):
-        return "cut_line"
-    if u.startswith("CENTER"):
-        return "center"
-    return "visible"
-
-
-def bbox(e):
-    t = e.dxftype()
-    if t == "LINE":
-        s, en = e.dxf.start, e.dxf.end
-        return (min(s.x, en.x), min(s.y, en.y), max(s.x, en.x), max(s.y, en.y))
-    if t in ("CIRCLE", "ARC"):
-        c, r = e.dxf.center, e.dxf.radius
-        return (c.x - r, c.y - r, c.x + r, c.y + r)
-    if t == "ELLIPSE":
-        return _ellipse_extent(e)
-    return None
-
-
-def _ellipse_extent(e):
-    """True extent of an ELLIPSE (arc) by sampling its construction tool -- exact enough for
-    clustering and for the visible-geometry box (64 samples: < 0.01 mm at any drawn size)."""
-    try:
-        ct = e.construction_tool()
-        pts = [(float(v.x), float(v.y)) for v in ct.vertices(ct.params(64))]
-    except Exception:
-        return None
-    if not pts:
-        return None
-    return (min(p[0] for p in pts), min(p[1] for p in pts),
-            max(p[0] for p in pts), max(p[1] for p in pts))
-
-
-# A drawing-scale ratio inside a view label ("A-A 1 : 1", "DETAIL B 2:1", "M 1:2"). Bare integers
-# on either side only -- a bare "3:4" in prose would also match, which is why the caller additionally
-# requires the text to sit beside a view and outside the title block.
-_SCALE_RE = re.compile(r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)(?![\d.,])")
-
-_NUM_RE = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
-
-
-def printed_text(doc, e):
-    """What the DRAWING PRINTS for this dimension.
-
-    A DXF DIMENSION carries a reference to an anonymous BLOCK holding its drawn representation --
-    extension lines, arrowheads, and the MTEXT with the value as the CAD system formatted it. That
-    text is ground truth, and it is the only reliable source for two whole classes of value that
-    the DWG->DXF route corrupts: every ANGULAR measurement comes back as 180+theta (s-7's 7.9 deg
-    bend reads 187.8765), and a RADIUS loses its arc side. It also cross-checks every linear value
-    against DIMLFAC and the per-view scale for free."""
-    blk = e.dxf.geometry if e.dxf.hasattr("geometry") else None
-    if not blk or blk not in doc.blocks:
-        return None
-    out = [(b.text if b.dxftype() == "MTEXT" else b.dxf.text)
-           for b in doc.blocks[blk] if b.dxftype() in ("MTEXT", "TEXT")]
-    return _decode_cad_escapes(" ".join(t for t in out if t).strip()) or None
-
-
-# AutoCAD's %% control codes. They must be DECODED, not stripped: the symbol is evidence.
-# s-6 prints two dimensions as '%%c<>' -- DXF dimtype base 0, i.e. plain LINEAR entities whose
-# author typed a diameter prefix by hand. The entity type says "linear"; the drawing says
-# "diameter 60". R18 -- what the drawing PRINTS arbitrates -- so the symbol has to survive into
-# `printed`, where the reader of the payload can see it. The reader does NOT reclassify the
-# dimension on that evidence: two instances in one sample is not a rule.
-_CAD_ESCAPES = (("%%c", "Ø"), ("%%C", "Ø"),   # diameter
-                ("%%d", "°"), ("%%D", "°"),   # degree
-                ("%%p", "±"), ("%%P", "±"),   # plus/minus
-                ("%%%", "%"))
-
-
-def _decode_cad_escapes(txt):
-    if not txt:
-        return txt
-    for code, glyph in _CAD_ESCAPES:
-        txt = txt.replace(code, glyph)
-    return txt
-
-
-def printed_value(txt):
-    """The number inside a printed dimension string, or None. Strips MTEXT formatting runs and the
-    CAD symbols -- both as raw escapes (%%c diameter, %%d degree) and as the glyphs
-    `_decode_cad_escapes` turns them into -- and accepts a comma decimal separator."""
-    if not txt:
-        return None
-    t = re.sub(r"\\[A-Za-z][^;]*;", " ", txt)
-    for junk in ("%%c", "%%C", "%%d", "%%D", "%%p", "%%P",
-                 "Ø", "°", "±", "{", "}"):
-        t = t.replace(junk, " ")
-    m = _NUM_RE.search(t)
-    return float(m.group(0).replace(",", ".")) if m else None
-
-
-def reconcile_angular(computed, printed):
-    """Which of an ANGULAR dim's two candidates is the real angle. Returns (value, mismatch).
-
-    The DWG->DXF route loses an angular dimension's SIDE, and the damage lands on EITHER
-    candidate: usually the stored measurement comes back as 180+theta (s-7: a 7.9 deg bend reads
-    187.8765, a 45 deg weld bevel reads 225), but on f-3 it is the RENDERED BLOCK TEXT that is
-    wrong -- it prints 250 where the measurement, the ray geometry AND the view's own ellipse
-    foreshortening all say 110 (250 = 360 - 110, the explement).
-
-    Measured over every angular dimension in the sample set (7): 2 agree, 4 have a corrupt
-    measurement, 1 has corrupt printed text -- and in ALL SEVEN exactly one candidate is <= 180,
-    which is the true one every time. A mechanical drawing does not dimension a reflex angle. So
-    on disagreement take the candidate <= 180; if BOTH exceed it there is no evidence to choose on,
-    so keep the printed value (R18's default) and let the caller flag `printed_mismatch`."""
-    if printed is None:
-        return computed, False
-    if computed is None:
-        return printed, False
-    mismatch = abs(computed - printed) > max(0.01, 0.01 * abs(printed))
-    if mismatch and (computed <= 180.0) != (printed <= 180.0):
-        return (computed if computed <= 180.0 else printed), True
-    return printed, mismatch
-
-
-_CARDINALS = (0.0, 90.0, 180.0, 270.0)
-
-
-def arc_bbox(cx, cy, r, a1, a2):
-    """The TRUE bbox of an arc, not of its full circle.
-
-    bbox() above deliberately returns the CIRCLE box: for CLUSTERING an over-estimate is safe. For
-    MEASURING a view it is not — s-3's break-line arcs (r = 26.88 mm drawn across a 35 mm wide part)
-    pushed its front view's reported size from 35 x 125 to 74 x 129 and, worse, moved its box far
-    enough that the true projection pair with the side view failed the shared-span test."""
-    a1, a2 = a1 % 360.0, a2 % 360.0
-    sweep = (a2 - a1) % 360.0 or 360.0
-    xs = [cx + r * math.cos(math.radians(a)) for a in (a1, a2)]
-    ys = [cy + r * math.sin(math.radians(a)) for a in (a1, a2)]
-    for ang in _CARDINALS:                       # a quadrant point is an extremum only if swept
-        if ((ang - a1) % 360.0) <= sweep:
-            xs.append(cx + r * math.cos(math.radians(ang)))
-            ys.append(cy + r * math.sin(math.radians(ang)))
-    return (min(xs), min(ys), max(xs), max(ys))
-
-
-def geom_bbox(doc, items):
-    """Bbox over REAL part geometry only — the box a view's SIZE and its projection-pair test must
-    use, as opposed to the cluster box, which is an over-estimate by construction.
-
-    Taken from the VISIBLE class alone, because the visible silhouette bounds an orthographic view
-    by definition: hidden geometry is obscured and therefore inside it, centre lines overhang by
-    drafting convention, cut lines overhang too — and BREAK-VIEW furniture, drawn hidden on s-3,
-    overhangs the silhouette on both sides. Arcs contribute their true extent (arc_bbox). Falls
-    back through hidden and then the raw cluster for a cluster with no visible primitive.
-
-    KNOWN GAP (measured, deliberately not patched): on a borderless sheet the section-arrow
-    apparatus (a lw-35 stroke + a lw=-1 arrowhead per end; real edges are lw 25) clusters INTO the
-    view that carries the cut line and inflates its measured size (f-3's 100x40 front view reads
-    124x49.6). Excluding it by cut-end proximity is UNSOUND — the cut line may run exactly along a
-    real edge (f-3 cuts at its own step height), and any transitive flood from the ends eats the
-    silhouette (f-2's front view measured 17x9 that way). The apparatus is symmetric about the cut
-    line, so the MIDPOINT alignment grade survives the inflation; a future exclusion must key on
-    the lineweight evidence, not on geometry."""
-    for keep in (("visible",), ("visible", "hidden"), None):
-        boxes = []
-        for e, b in items:
-            if keep is not None and edge_class(doc, e) not in keep:
-                continue
-            if e.dxftype() == "ARC":
-                c = e.dxf.center
-                boxes.append(arc_bbox(c.x, c.y, e.dxf.radius, e.dxf.start_angle, e.dxf.end_angle))
-            else:
-                boxes.append(b)
-        if boxes:
-            return (min(b[0] for b in boxes), min(b[1] for b in boxes),
-                    max(b[2] for b in boxes), max(b[3] for b in boxes))
-    return None
-
-
-def cluster(items, gap):
-    """Union-find on bbox proximity -> connected groups of primitives."""
-    par = list(range(len(items)))
-
-    def find(a):
-        while par[a] != a:
-            par[a] = par[par[a]]
-            a = par[a]
-        return a
-
-    for i in range(len(items)):
-        for j in range(i + 1, len(items)):
-            a, b = items[i][1], items[j][1]
-            if a[0] <= b[2] + gap and b[0] <= a[2] + gap and a[1] <= b[3] + gap and b[1] <= a[3] + gap:
-                ra, rb = find(i), find(j)
-                if ra != rb:
-                    par[ra] = rb
-    groups = {}
-    for i, it in enumerate(items):
-        groups.setdefault(find(i), []).append(it)
-    return list(groups.values())
+try:                             # normal: imported as part of the `drawing` package
+    from .dxf_entities import (
+        _r,
+        _READ_TYPES,
+        DIMKIND,
+        _text_of,
+        _walk_block,
+        _block_rows,
+        _block_has_geometry,
+        ellipse_params,
+        edge_class,
+        bbox,
+        _ellipse_extent,
+        _SCALE_RE,
+        _NUM_RE,
+        printed_text,
+        _CAD_ESCAPES,
+        _decode_cad_escapes,
+        printed_value,
+        reconcile_angular,
+        _CARDINALS,
+        arc_bbox,
+        geom_bbox,
+        cluster,
+    )
+except ImportError:              # fallback: run directly as a script from this directory
+    from dxf_entities import (
+        _r,
+        _READ_TYPES,
+        DIMKIND,
+        _text_of,
+        _walk_block,
+        _block_rows,
+        _block_has_geometry,
+        ellipse_params,
+        edge_class,
+        bbox,
+        _ellipse_extent,
+        _SCALE_RE,
+        _NUM_RE,
+        printed_text,
+        _CAD_ESCAPES,
+        _decode_cad_escapes,
+        printed_value,
+        reconcile_angular,
+        _CARDINALS,
+        arc_bbox,
+        geom_bbox,
+        cluster,
+    )
 
 
 # --------------------------------------------------------------------------- main read
@@ -726,8 +485,6 @@ def read(path, cfg):
         return None
 
     # ---- dimensions: TRUE value + kind + owning view -----------------------------------
-    DIMKIND = {0: "linear", 1: "aligned", 2: "angular", 3: "diameter", 4: "radius",
-               5: "angular3p", 6: "ordinate"}
     # every arc/circle in PAPER coords, tagged with its view-local id -- the lookup table a
     # radius/diameter dimension is resolved against (see the RADIUS note below)
     round_prims = []

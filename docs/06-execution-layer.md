@@ -81,9 +81,19 @@ Error codes follow `<THING>_NOT_FOUND`, `<OP>_FAILED`, `UNSUPPORTED_<X>`, plus `
 | `.Sketch.cs` | `create_sketch`, `add_sketch_entity`, `add_sketch_entities`, `add_dimension`, `add_sketch_constraint`, `edit_sketch` |
 | `.Features.cs` | `extrude_feature`, `create_rib`, `add_edge_feature`, `add_reference_geometry`, `create_pattern`, `set_part_material`, `modify_dimension`, `edit_feature` |
 | `.SheetMetal.cs` | `sheet_metal_feature` (base_flange, edge_flange, edge_flange_sketch/finish, sketched_bend, flat_pattern) |
-| `.Analyze.cs` | `analyze_model`, `get_selection` |
-| `.Drawing.cs` | `create_drawing`, `add_drawing_view`, `add_flat_pattern_view`, `add_drawing_dimension`, `auto_dimension_drawing`, `auto_center_marks`, `add_hole_callout`, `add_section_view`, `analyze_slddrw_test` (method `AnalyzeDrawing`) |
+| `.Analyze.cs` | `analyze_model` (dispatch), `get_selection`, `FlattenFaces` / `FlattenEdges`, `IndexByJson` |
+| `.Analyze.FeatureTree.cs` | `analyze_model(features)` reader: feature/sketch/dimension/pattern/equation JSON |
+| `.Analyze.Topology.cs` | `analyze_model(edges|faces|bodies|feature_map)`: edge/face/body JSON, rollback-based feature attribution |
+| `.Drawing.cs` | `create_drawing`, `add_drawing_view`, `add_flat_pattern_view`, `add_drawing_dimension`, `add_section_view` + view helpers |
+| `.Drawing.Annotations.cs` | `auto_dimension_drawing`, `auto_center_marks`, `add_hole_callout` |
+| `.Drawing.Reader.cs` | `analyze_slddrw_test` (method `AnalyzeDrawing`): view/dimension/geometry/relation/section readers |
 | `.Assembly.cs` | `open_new_assembly`, `analyze_assembly`, `insert_component`, `add_mate`, `save_body_as_part` |
+
+All files are `partial class SolidWorksService`; the split is by responsibility only (no behavior change). A new `.cs` file must be added to `SolidworksExecution.csproj` (old-style project, no globbing).
+
+### Tool execution boundary
+
+`SolidWorksService.ExecuteTool(...)` is the shared wrapper for a tool method: duplicate-`operationId` check → `stateVersion` validation → `EnsureConnected` → the tool body → `COMException` / `Exception` mapped to a `FAILED` response. `BuildCompletedResponse(...)` builds the standard `COMPLETED` payload. New tools should use both instead of re-implementing the preamble.
 
 Naming trap: the C# method `AnalyzeDrawing` is the old native-SLDDRW reader, exposed as `analyze_slddrw_test`. The MCP tool `analyze_drawing` is the DXF/DWG reader and lives entirely in the adapter.
 

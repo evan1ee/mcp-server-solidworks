@@ -95,7 +95,11 @@
     <Compile Include="Services\SolidWorksService.Features.cs" />
     <Compile Include="Services\SolidWorksService.SheetMetal.cs" />
     <Compile Include="Services\SolidWorksService.Drawing.cs" />
+    <Compile Include="Services\SolidWorksService.Drawing.Annotations.cs" />
+    <Compile Include="Services\SolidWorksService.Drawing.Reader.cs" />
     <Compile Include="Services\SolidWorksService.Analyze.cs" />
+    <Compile Include="Services\SolidWorksService.Analyze.FeatureTree.cs" />
+    <Compile Include="Services\SolidWorksService.Analyze.Topology.cs" />
     <Compile Include="Services\SolidWorksService.Assembly.cs" />
     <Compile Include="Services\SolidWorksService.Brep.cs" />
     <Compile Include="Startup.cs" />

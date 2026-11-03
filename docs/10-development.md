@@ -23,6 +23,7 @@ That file pulls the runtime requirements (`mcp`, `httpx`, `python-dotenv`, `ezdx
 | Drawing reader | `cd cad-planner/drawing && python -m tests.test_draw_contract` | dialect drift, chaining/pairing/gate goldens, IR validity |
 | STEP recognizer | `python cad-planner/recognition/tests/test_recognition.py` | blends, classification, prismatic/turned decomposition, IR validity on recorded STEP-import fixtures |
 | Convert tool | `cd adapters/claude && python tests/test_convert_features.py` | `convert_to_features` orchestration (history guard, drop-and-continue, labels, artifact) with SolidWorks faked |
+| Adapter modules | `pytest adapters/claude/tests/test_mcp_surface_regression.py` | extracted adapter modules (state helpers, recipes, drawing formatting, `save_analysis`, `compare_*`, IR doors) and the `_call` state-version resync, with SolidWorks faked |
 
 Each also runs under pytest, e.g. `pytest compiler/solidworks/pycompiler/tests/test_compiler.py::test_sketch_extrude_boss_path`. The standalone runners print `ok`/`FAIL` per test and exit non-zero on failure.
 
@@ -62,10 +63,10 @@ Start-Process execution\solidworks\SolidworksExecution\bin\Debug\SolidworksExecu
 ## Adding a low-level tool
 
 1. **Contract:** add the entry to `execution/solidworks/contracts/tool-schemas.json` (description, `input.params`).
-2. **C#:** add `case "tool_name":` to `ToolController.Dispatch` and implement the method in the matching `SolidWorksService.<Family>.cs`, following the standard preamble (duplicate → version → connected → work → `RegisterCompleted`). A new file also needs a `<Compile Include>` in the csproj.
+2. **C#:** add `case "tool_name":` to `ToolController.Dispatch` and implement the method in the matching `SolidWorksService.<Family>.cs`, following the standard preamble (duplicate → version → connected → work → `RegisterCompleted`) — wrap the body in the shared `ExecuteTool(...)` helper and build the result with `BuildCompletedResponse(...)` rather than copying the preamble. A new file also needs a `<Compile Include>` in the csproj.
    - Reflect the interop assembly to confirm every COM signature; decode unknown return shapes against a live document before writing the parser.
    - Inline `swconst` values as ints; don't use the enum types.
-3. **Adapter:** add the `@mcp.tool(structured_output=False)` function in `server.py`. Use `Literal` for discriminators, `Annotated[float, Field(...)]` for ranges and units, JSON strings for arrays, `-1` sentinels for optional indices, and forward via `_call(name, params)`.
+3. **Adapter:** add the `@mcp.tool(structured_output=False)` function in `server.py`. Use `Literal` for discriminators, `Annotated[float, Field(...)]` for ranges and units, JSON strings for arrays, `-1` sentinels for optional indices, and forward via `_call(name, params)`. An adapter-side (orchestration) tool keeps only its signature + docstring in `server.py` and delegates to a function in the matching module (see [03-adapter.md](03-adapter.md)), passing `_call_raw` in.
 4. Run the contract test, build, restart the exe, reconnect MCP, verify live.
 
 ## Adding an IR feature

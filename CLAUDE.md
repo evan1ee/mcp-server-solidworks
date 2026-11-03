@@ -43,12 +43,13 @@ Contracts and implementation take precedence over prose. Older `*/architecture.m
 - Plausible-looking COM APIs can be incorrect. Follow [`docs/06-execution-layer.md`](docs/06-execution-layer.md#com-gotchas-worth-knowing-before-you-edit).
 - Inline `swconst` values as integer constants; do not use enum types that would require a missing DLL in `bin/Debug`.
 - Tool parameters are `JObject`; read them using the established `p.Value<T>("key")` pattern.
-- Follow the standard tool preamble: duplicate check → version check → connected check → work → `RegisterCompleted`.
+- Follow the standard tool preamble: duplicate check → version check → connected check → work → `RegisterCompleted`. New tools get it from the shared `ExecuteTool(...)` / `BuildCompletedResponse(...)` helpers in `SolidWorksService.cs` instead of re-implementing it.
 - A new `.cs` file requires a corresponding `<Compile Include>` entry in the project file.
 
 ### MCP adapter
 
 - Model-facing tool guidance belongs in `server.py`, including `Literal`, Pydantic `Field`, and docstrings. The model does not see `tool-schemas.json` directly.
+- `server.py` holds the MCP surface (tool/resource definitions, `_state_version`, `_call`/`_call_raw`). Orchestration logic lives in `state_manager.py`, `recipes.py`, `analysis_pipeline.py`, `comparison.py`, `drawing_pipeline.py`, `ir_runner.py`, `feature_conversion.py`; those modules never import `server.py` and receive stateful callables (`_call_raw`, `_run_graph`, …) as parameters. Keep `_draw.<name>` calls and `recipe://`/`schema://` URIs in `server.py` — the contract test scans that file.
 - Array parameters are JSON strings, not Python `list` types.
 - Optional indices use `-1` sentinels.
 - Never write debug output to stdout; stdout is the JSON-RPC stream. Use `adapter_log`.
@@ -106,6 +107,7 @@ pip install -r adapters/claude/requirements-dev.txt
 (cd cad-planner/drawing && python -m tests.test_draw_contract)                     # drawing contract
 python cad-planner/recognition/tests/test_recognition.py                            # STEP→features recognizer
 (cd adapters/claude && python tests/test_convert_features.py)                       # convert_to_features orchestration
+pytest adapters/claude/tests/                                                        # all adapter tests incl. MCP surface regression
 pytest compiler/solidworks/pycompiler/tests/test_compiler.py::test_sketch_extrude_boss_path   # single test
 ```
 

@@ -1,18 +1,26 @@
-"""pycompiler — deterministic Feature Graph IR compiler (EXPERIMENTAL, P1.4/P1.7).
+"""pycompiler — deterministic Feature Graph IR compiler.
 
-Lowers a CAD-neutral Feature Graph IR (cad-planner/contracts/feature-graph.schema.json,
-v0-exp subset) into ordered calls to the EXISTING execution/solidworks low-level tools, and
-resolves semantic references (top_face / center) against live geometry.
+Lowers a CAD-neutral Feature Graph IR (cad-planner/contracts/feature-graph.schema.json)
+into ordered calls to the execution/solidworks low-level tools, and resolves semantic and
+geometric references against live geometry via ExecutionPort.
 
-Architectural rules (see compiler/solidworks/architecture.md + master-architecture.md):
+Architectural rules (see docs/05-compiler.md + master-architecture.md):
   - Deterministic. NO LLM, NO MCP, NO COM.
   - Reaches the execution layer ONLY through an injected ExecutionPort (plain REST behind it),
-    never by importing the adapter, the MCP SDK, or httpx. This is what keeps the module separable:
-    moving it into a standalone REST service later is a transport swap behind ExecutionPort,
-    with the lowering / resolver / validation logic untouched (IR-ADR-003).
-
-This is the experimental IR path. It coexists with the 26 low-level tools and does NOT change
-them. See logs-ir.md for the ledger (IR-ADR-NNN).
+    never by importing the adapter, the MCP SDK, or httpx. Moving it into a standalone REST
+    service is a transport swap behind ExecutionPort, with lowering / resolver / validation
+    logic untouched (IR-ADR-003).
 """
 
-from .compiler import compile_and_run, CompileResult  # noqa: F401
+from .compiler import CompileResult, compile_and_run  # noqa: F401
+from .errors import FeatureError  # noqa: F401
+from .execution_port import ExecutionPort  # noqa: F401
+from .ir_schema import validate  # noqa: F401
+
+__all__ = [
+    "CompileResult",
+    "ExecutionPort",
+    "FeatureError",
+    "compile_and_run",
+    "validate",
+]

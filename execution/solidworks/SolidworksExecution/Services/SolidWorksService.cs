@@ -1073,18 +1073,7 @@ namespace SolidworksExecution.Services
         // start reference 32, bodies 8) — matches CodeStack's working up-to-surface example.
         private bool SelectFaceByIndexAppend(IModelDoc2 modelDoc, int faceIndex, int mark)
         {
-            var partDoc = modelDoc as IPartDoc;
-            var allFaces = new List<IFace2>();
-            object[] bodies = partDoc?.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
-            if (bodies != null)
-                foreach (var b in bodies)
-                {
-                    var body = b as IBody2;
-                    if (body == null) continue;
-                    object[] fs = body.GetFaces() as object[];
-                    if (fs == null) continue;
-                    foreach (var f in fs) { var fa = f as IFace2; if (fa != null) allFaces.Add(fa); }
-                }
+            var allFaces = FlattenFaces(modelDoc as IPartDoc);
             if (faceIndex < 0 || faceIndex >= allFaces.Count) return false;
             var ent = allFaces[faceIndex] as IEntity;
             if (ent == null) return false;
@@ -1120,6 +1109,74 @@ namespace SolidworksExecution.Services
                 feat = feat.GetNextFeature() as IFeature;
             }
             return found;
+        }
+
+        private ExecutionResponse ExecuteTool(
+            ToolRequest request,
+            Func<JObject, ExecutionResponse> action,
+            bool checkStateVersion = true)
+        {
+            if (_guard.IsDuplicate(request.OperationId))
+                return _guard.GetDuplicate(request.OperationId);
+
+            if (checkStateVersion && !_guard.IsStateVersionValid(request.StateVersion))
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "INVALID_STATE_VERSION", "Incoming state_version does not match current state.");
+
+            if (!EnsureConnected())
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ATTACH_FAILED", "SolidWorks process not found or COM not registered.");
+
+            try
+            {
+                return action(request.Params as JObject);
+            }
+            catch (COMException ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "COM_ERROR", ex.Message);
+            }
+            catch (Exception ex)
+            {
+                return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),
+                    "UNEXPECTED_ERROR", ex.Message);
+            }
+        }
+
+        private ExecutionResponse BuildCompletedResponse(
+            ToolRequest request,
+            IModelDoc2 modelDoc,
+            string documentType,
+            bool incrementStateVersion = true,
+            bool registerCompleted = true,
+            string activeSketch = null,
+            List<string> features = null,
+            List<string> dimensions = null,
+            JObject resultGeometry = null)
+        {
+            int sv = _guard.GetCurrentStateVersion() + (incrementStateVersion ? 1 : 0);
+            var response = new ExecutionResponse
+            {
+                OperationId = request.OperationId,
+                Status = "COMPLETED",
+                Verified = true,
+                StateVersion = sv,
+                CadState = new CadState
+                {
+                    StateVersion = sv,
+                    ActiveDocument = modelDoc?.GetTitle(),
+                    DocumentType = documentType,
+                    ActiveSketch = activeSketch,
+                    Features = features ?? new List<string>(),
+                    Dimensions = dimensions ?? new List<string>()
+                },
+                ResultGeometry = resultGeometry,
+                Error = null
+            };
+
+            if (registerCompleted)
+                _guard.RegisterCompleted(request.OperationId, response);
+            return response;
         }
 
         private ExecutionResponse BuildFailed(string operationId, int stateVersion, string code, string message)

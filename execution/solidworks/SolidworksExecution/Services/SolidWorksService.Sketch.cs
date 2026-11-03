@@ -59,18 +59,7 @@ namespace SolidworksExecution.Services
                     int? faceIndex = p?.Value<int?>("face_index");
                     if (faceIndex != null)
                     {
-                        var partDoc = modelDoc as IPartDoc;
-                        var allFaces = new List<IFace2>();
-                        object[] bodies = partDoc?.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
-                        if (bodies != null)
-                            foreach (var b in bodies)
-                            {
-                                var body = b as IBody2;
-                                if (body == null) continue;
-                                object[] fs = body.GetFaces() as object[];
-                                if (fs == null) continue;
-                                foreach (var f in fs) { var fa = f as IFace2; if (fa != null) allFaces.Add(fa); }
-                            }
+                        var allFaces = FlattenFaces(modelDoc as IPartDoc);
                         int fi = faceIndex.Value;
                         if (fi < 0 || fi >= allFaces.Count)
                             return BuildFailed(request.OperationId, _guard.GetCurrentStateVersion(),

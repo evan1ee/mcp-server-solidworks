@@ -29,12 +29,7 @@ except ImportError:
     from pycompiler.execution_port import ExecutionPort
 
 from execution_client import call_tool, get_state          # noqa: E402
-
-
-def _is_state_mismatch(resp):
-    if resp.get("status") != "FAILED":
-        return False
-    return (resp.get("error") or {}).get("code") == "INVALID_STATE_VERSION"
+from state_manager import is_state_mismatch as _is_state_mismatch  # noqa: E402
 
 
 class AdapterExecutionPort(ExecutionPort):

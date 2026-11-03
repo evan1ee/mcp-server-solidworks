@@ -524,18 +524,7 @@ namespace SolidworksExecution.Services
                 {
                     // Flatten all solid-body edges in the SAME order analyze_model(edges) reports, then select
                     // the i-th IEdge directly (no coordinate pick).
-                    var partDoc = modelDoc as IPartDoc;
-                    var allEdges = new List<IEdge>();
-                    object[] bodies = partDoc?.GetBodies2((int)swBodyType_e.swSolidBody, true) as object[];
-                    if (bodies != null)
-                        foreach (var b in bodies)
-                        {
-                            var body = b as IBody2;
-                            if (body == null) continue;
-                            object[] es = body.GetEdges() as object[];
-                            if (es == null) continue;
-                            foreach (var e in es) { var ed = e as IEdge; if (ed != null) allEdges.Add(ed); }
-                        }
+                    var allEdges = FlattenEdges(modelDoc as IPartDoc);
                     for (int i = 0; i < indexArray.Count; i++)
                     {
                         int ei = indexArray[i].Value<int>();

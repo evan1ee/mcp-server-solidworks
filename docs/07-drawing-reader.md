@@ -14,6 +14,7 @@ Reads a 2D manufacturing drawing (**.DXF**, or **.DWG** converted to DXF) and ei
 | Module | Role |
 |---|---|
 | `dxf_read.py` | The **only** module that touches DXF/`ezdxf` (imported lazily, so tests and CI don't need it). `read(path, cfg)` runs the whole extraction. |
+| `dxf_entities.py` | Low-level, `ezdxf`-free helpers used by `dxf_read.py`: entity/bbox/text/dimension extraction helpers and clustering. Re-exported from `dxf_read` so existing imports keep working. |
 | `curvefit.py` | Collapses polyline "fans" (exploded curves) back into parametric ellipses under a residual gate. |
 | `contour.py` | Chains primitives into closed loops (Tier A strict; Tier B outer-face fallback). |
 | `pairing.py` | Pairs sheet-metal bend notes with bend lines. |

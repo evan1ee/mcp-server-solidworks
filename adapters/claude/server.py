@@ -1,19 +1,63 @@
-import hashlib
 import inspect
 import json
 import os
 import sys
-import tempfile
-import uuid
-from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional
 from pydantic import Field
 from mcp.server import MCPServer
 from mcp.server.caching import CacheHint
-from mcp.server.mcpserver.exceptions import ResourceError
-from execution_client import call_tool, get_state, ensure_ready as _ensure_ready, ExecutionLayerError
+from execution_client import call_tool, get_state, ensure_ready as _ensure_ready
 from response_mapper import map_response
-from adapter_log import write as _adapter_log
+# Some names below are imported only so that server.<name> keeps resolving for existing
+# tests/callers (backward-compatible re-exports after the module split) - they are unused here.
+from state_manager import (
+    next_operation_id as _next_operation_id,
+    is_state_mismatch as _is_state_mismatch,
+    analysis_items as _analysis_items,
+    kv_dict as _kv_dict,
+)
+from recipes import (
+    _RECIPE_SECTIONS,
+    _recipe_sections,
+    _recipe_section_text,
+    _contract_json,
+    _feature_graph_schema_text,
+    format_get_recipe as _format_get_recipe,
+    format_recipe_index_resource as _format_recipe_index_resource,
+)
+from drawing_pipeline import (
+    summarise_direct as _summarise_direct,
+    advisories as _advisories,
+    wire_json as _wire_json,
+    format_direct_build_result as _format_direct_build_result,
+)
+from analysis_pipeline import (
+    ANALYSIS_SCHEMA_VERSION,
+    collect_parameters as _collect_parameters,
+    save_assembly_analysis as _save_assembly_analysis_impl,
+    run_save_analysis as _run_save_analysis,
+)
+from comparison import (
+    compare_docs as _compare_docs_impl,
+    run_compare_parts as _run_compare_parts,
+    run_compare_assemblies as _run_compare_assemblies,
+    _diff_faces,
+    _face_desc,
+    _faces_compatible,
+)
+from ir_runner import (
+    run_graph as _run_graph_impl,
+    run_rebuild_from_ir as _run_rebuild_from_ir,
+    run_submit_feature_graph as _run_submit_feature_graph,
+)
+from feature_conversion import (
+    _RecognitionView,
+    recognize_brep as _recognize_brep_impl,
+    _default_output_path,
+    _is_history_less,
+    _drop_failed,
+    run_convert_to_features as _run_convert_to_features,
+)
 # NOTE: pycompiler is reached via `from ir_execution_port import run_feature_graph` imported
 # LAZILY inside rebuild_from_ir and submit_feature_graph — a missing compiler tree degrades to a
 # clean tool error instead of killing the whole MCP server at startup.
@@ -63,21 +107,11 @@ mcp = MCPServer(
 _state_version: int = 0
 
 
-def _next_operation_id() -> str:
-    return str(uuid.uuid4())
-
-
 def _update_state_version(response: dict) -> None:
     global _state_version
     sv = response.get("stateVersion")
     if sv is not None:
         _state_version = sv
-
-
-def _is_state_mismatch(response: dict) -> bool:
-    if response.get("status") != "FAILED":
-        return False
-    return (response.get("error") or {}).get("code") == "INVALID_STATE_VERSION"
 
 
 def _call(tool_name: str, params: dict) -> str:
@@ -1002,133 +1036,6 @@ except Exception as _exc:                     # noqa: BLE001 - startup must surv
     _RECOGNITION_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 
-def _summarise_direct(art, summary, graph):
-    """The DIRECT_BUILDABLE result: everything needed to JUDGE the build, and nothing else.
-
-    The contour deliberately stays out. A real laser outline is scores of segments; showing it and
-    then having the model echo it back into submit_feature_graph would cost the tokens twice over
-    and invite a transcription error in between — which is the whole reason the lowering exists."""
-    b, th = summary["blank"], summary["thickness"]
-    cuts = ", ".join("%gx%g @ (%g,%g)"
-                     % (c["bbox"][2] - c["bbox"][0], c["bbox"][3] - c["bbox"][1],
-                        round((c["bbox"][0] + c["bbox"][2]) / 2, 2),
-                        round((c["bbox"][1] + c["bbox"][3]) / 2, 2))
-                     for c in b["cutouts"]) or "none"
-    lines = [
-        "DIRECT_BUILDABLE | sheet-metal flat pattern | %s | sha256 %s"
-        % (art["source"]["file"], art["source"]["sha256"][:12]),
-        "  blank      %g x %g mm | outer loop %d segments | cutouts: %s"
-        % (b["size"][0], b["size"][1], b["outer_segments"], cuts),
-        "  thickness  %g mm  (%s)   bend radius %g mm   K %g"
-        % (th["value_mm"], th["source"], summary["bends"][0]["radius_mm"], summary["k_factor"]),
-        "  bends      %d, each corroborated by its line's edge class:" % len(summary["bends"]),
-    ]
-    for r in summary["bends"]:
-        x1, y1, x2, y2 = r["line"]
-        lines.append("               %-4s %g deg R%g  line %s  midpoint (%g, %g)%s"
-                     % (r["dir"], r["angle_deg"], r["radius_mm"], r["class"],
-                        round((x1 + x2) / 2, 4), round((y1 + y2) / 2, 4),
-                        "  [WARNING: in a closed loop]" if r["in_loop"] else ""))
-    for r in summary["skipped_bends"]:
-        lines.append("  SKIPPED    %s note at %s — %s (candidates %s). It will NOT be built."
-                     % (r["dir"], r["at"], r["reason"], r["candidates"]))
-    lines += [
-        "  expected   blank area %g mm^2 -> V = %r m^3  (bending does not change it at K=0.5)"
-        % (b["area_mm2"], summary["expected"]["volume_m3"]),
-        "  graph      %d IR nodes: sketch + sheet_metal, then sketch + sketched_bend per direction"
-        % len(graph["nodes"]),
-        "  NEXT       mode='build' builds it | mode='ir' shows the graph first.",
-        "             AFTER building, verify: analyze_model('mass_properties')",
-        "             against the expected volume above, and read one bend face back — a mirrored",
-        "             fold is invisible to volume, area and topology alike (recipe R14).",
-    ]
-    if summary["skipped_bends"]:
-        lines.append("             A skipped bend is invisible to ALL of those (the blank volume is "
-                     "unchanged): add it by hand or declare it as a gap (R15).")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# ADVISORIES — the third home (payload trim phase 5, 2026-09-07)
-# ---------------------------------------------------------------------------
-# Three channels carry what the model needs, and each costs differently: a tool docstring is paid
-# EVERY session whatever the job, a recipe section once per job that fetches it, and a payload note
-# only when the thing it warns about actually happens. So guidance that applies to ONE flag belongs
-# on that flag: `reverse` used to spend a paragraph on "if you see printed_mismatch, do X" in every
-# read, whether or not any dimension carried it.
-#
-# Computed HERE, in the adapter, deliberately NOT in the reader: the saved artifact stays pure DATA
-# (the research pool is not polluted, ANALYSIS_VERSION does not move, the draw-dialect contract and
-# gate 4 are untouched). Only the ANSWER gains a short advisory block.
-#
-# A closed set, one line each, emitted ONCE per condition with the places it fired.
-def _advisories(art) -> str:
-    """A short plain-text block naming the conditions this read actually raised. '' when none."""
-    out = []
-    views = art.get("views") or []
-
-    scaled = [v["vid"] for v in views if v.get("scale_factor") is not None]
-    if scaled:
-        out.append("view scale_factor @ %s — this view is drawn at a DIFFERENT ratio from the "
-                   "sheet; say which factor produced a number before you quote it."
-                   % ", ".join(scaled))
-
-    not_read = (art.get("sheet") or {}).get("not_read") or {}
-    if not_read:
-        out.append("not_read @ sheet (%s) — the reader saw these and did not emit them; a named "
-                   "block you cannot account for is evidence that never reached you."
-                   % ", ".join(sorted(not_read)))
-
-    ang, lin = [], []
-    for k, d in enumerate(art.get("dimensions") or []):
-        if d.get("printed_mismatch"):
-            (ang if d.get("kind") == "angular" else lin).append("dim[%d]" % k)
-    if ang:
-        out.append("printed_mismatch/ANGULAR @ %s — the value is a JUDGEMENT, not a reading; "
-                   "corroborate it against the geometry or an ellipse ratio before building."
-                   % ", ".join(ang))
-    if lin:
-        out.append("printed_mismatch @ %s — the scale, the arc match or the per-view factor is "
-                   "wrong. Reading the flag is free; ignoring it is not." % ", ".join(lin))
-
-    tier_b = ["%s/%s" % (v["vid"], lp.get("id"))
-              for v in views for lp in (v.get("loops") or []) if lp.get("tier") == "B"]
-    if tier_b:
-        out.append("tier:B @ %s — this boundary was WALKED, not chained; check its area against a "
-                   "stated length or width before you build on it." % ", ".join(tier_b))
-
-    unpaired = [b for b in (art.get("bend_notes") or []) if b.get("unpaired")]
-    if unpaired:
-        out.append("unpaired bend x%d — the reader refused to guess, so those bends are NOT built. "
-                   "Resolve them from the drawing or declare a gap; never split the difference."
-                   % len(unpaired))
-    in_loop = [b for b in (art.get("bend_notes") or [])
-               if (b.get("bend_line") or {}).get("in_loop")]
-    if in_loop:
-        out.append("bend_line in_loop x%d — the match landed on OUTLINE geometry, and a bend line "
-                   "belongs to no closed contour. Say so." % len(in_loop))
-
-    vg = art.get("view_graph")
-    if isinstance(vg, dict) and vg.get("solved") is False:
-        out.append("view_graph.solved:false (%s) — the axes did not join; that joining is yours."
-                   % vg.get("reason", "reason in the field"))
-
-    if not out:
-        return ""
-    return "\nADVISORIES (%d) — only what actually fired in THIS read:\n  %s" % (
-        len(out), "\n  ".join(out))
-
-
-def _wire_json(obj) -> str:
-    """The drawing payload, serialized as tightly as JSON allows.
-
-    `json.dumps` defaults to ', ' and ': ' — two bytes of whitespace per comma and colon, which on
-    an artifact made mostly of short numeric arrays is 18,854 B across the 10 samples (11 points of
-    payload, measured). Nothing is lost: JSON whitespace is not data.
-    """
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
 @mcp.tool(structured_output=False)
 def analyze_drawing(file_path: str, save_analysis: bool = True,
                     mode: Literal["auto", "ir", "build"] = "auto") -> str:
@@ -1343,22 +1250,7 @@ def analyze_drawing(file_path: str, save_analysis: bool = True,
         return _summarise_direct(art, verdict["summary"], graph) + _advisories(art)
 
     # mode == "build": the THIRD IR door — same _run_graph, same pycompiler (IR-ADR-005).
-    s = verdict["summary"]
-    text, ok, sv = _run_graph(graph, fresh_document=True)
-    if not ok:
-        return text
-    tail = ["", "built from %s (sha256 %s) | state_version=%s"
-            % (art["source"]["file"], art["source"]["sha256"][:12], sv),
-            "VERIFY: analyze_model('mass_properties') should read V = %r m^3 "
-            "(blank %g mm^2 x %g mm)." % (s["expected"]["volume_m3"], s["blank"]["area_mm2"],
-                                          s["thickness"]["value_mm"]),
-            "        then read one bend face back — volume, area and topology cannot see a "
-            "mirrored fold (recipe R14)."]
-    for r in s["skipped_bends"]:
-        tail.append("NOT BUILT: %s bend at %s (%s). The blank volume is unchanged by it, so no "
-                    "measurement will catch it — add it or declare it (R15)."
-                    % (r["dir"], r["at"], r["reason"]))
-    return text + "\n".join(tail)
+    return _format_direct_build_result(art, verdict["summary"], _run_graph, graph)
 
 
 # ---------------------------------------------------------------------------
@@ -1748,118 +1640,6 @@ def activate_document(title: str) -> str:
 # The recipe's PRIVATE full edition (`recipe.md`) is NEVER served — it carries lesson history and
 # provenance, is gitignored, and only the PUBLIC `-usage` twin appears on this surface.
 # ---------------------------------------------------------------------------
-_CAD_PLANNER_DIR = os.path.normpath(os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "cad-planner"))
-
-# The served section slugs, EXPLICIT (this replaces get_recipe's `Literal[...]`). The surface is
-# under the user's control by decision: a new `## slug — title` in recipe-usage.md does NOT
-# publish itself as a resource until it is added here, deliberately.
-_RECIPE_SECTIONS = (
-    "contract", "canonicalization", "forward", "mapping", "mapping_part",
-    "mapping_sheet_metal", "mapping_assembly", "verification", "reverse", "coverage",
-)
-
-
-def _recipe_sections():
-    """Parse cad-planner/recipe-usage.md into its version header + {slug: (title, body)} by the
-    '## slug — title' section headers. Read fresh on every call — the file ships with the server
-    and is small; no caching keeps edits live without a reconnect."""
-    path = os.path.join(_CAD_PLANNER_DIR, "recipe-usage.md")
-    with open(path, "r", encoding="utf-8-sig") as fh:
-        text = fh.read()
-    sections = {}
-    current = None
-    for line in text.splitlines():
-        if line.startswith("## ") and " — " in line:
-            slug, _, title = line[3:].partition(" — ")
-            current = slug.strip()
-            sections[current] = [title.strip(), []]
-        elif current is not None:
-            sections[current][1].append(line)
-    header = text.split("\n## ", 1)[0]  # the version/preamble block above the first section
-    return header, {k: (t, "\n".join(body).strip()) for k, (t, body) in sections.items()}
-
-
-def _recipe_section_text(section: str) -> str:
-    """One section, rendered with its own `## slug — title` header restored.
-
-    Read FRESH from disk on every call (via _recipe_sections), so editing recipe-usage.md goes
-    live with no reconnect — only the registration metadata below is snapshotted at import."""
-    _header, sections = _recipe_sections()
-    if section not in sections:
-        # MUST be ResourceError: the SDK re-raises ResourceError/MCPError verbatim but replaces any
-        # other exception's message with a generic "Error creating resource from template <uri>"
-        # (templates.py). Verified live — a plain ValueError left the caller with no idea what the
-        # valid slugs were, and a model that guesses (e.g. 'drawing', which was in the retired
-        # get_recipe enum but is not a section) needs the list to self-correct in one step.
-        raise ResourceError(
-            f"'{section}' is not a served recipe section. Served: "
-            f"{', '.join(_RECIPE_SECTIONS)}. Read recipe://usage/index for the full surface.")
-    title, body = sections[section]
-    return f"## {section} — {title}\n\n{body}"
-
-
-def _contract_json(filename: str) -> str:
-    with open(os.path.join(_CAD_PLANNER_DIR, "contracts", filename),
-              "r", encoding="utf-8-sig") as fh:
-        return fh.read()
-
-
-# ---------------------------------------------------------------------------
-# The IR schema, as the MODEL needs it (payload trim, 2026-09-07)
-# ---------------------------------------------------------------------------
-# `feature-graph.schema.json` serves two audiences at once and only one of them is the model.
-# Gate 3 (`pycompiler/tests/test_ir_schema_contract.py`) machine-diffs every ARRAY under
-# `covered_subset` against ir_schema.py's frozensets, and the prose beside those arrays documents
-# that contract for whoever maintains it. So the FILE cannot be trimmed — the trim happens HERE,
-# at serve time, on the copy the model receives.
-#
-# Dropped for every profile (measured; none of it is model-facing):
-#   _meta.status                                2,135 B — the version narrative (IR-ADR references,
-#                                                         "do NOT freeze before the MAT v1 set
-#                                                         arrives"): a developer's changelog.
-#   covered_subset._note/._grammar_note/.assumptions
-#                                               1,529 B — half of it gate 3's own machine-diff
-#                                                         instructions ("every ARRAY in this block
-#                                                         is diffed against ir_schema.py").
-# The covered_subset ARRAYS are left untouched: ~1,400 B carrying the entire capability list, the
-# highest-value bytes in the file.
-_SCHEMA_DEV_ONLY_SUBSET_KEYS = ("_note", "_grammar_note", "assumptions")
-
-# What a PROFILE drops on top of that. Two values, because only two of them mean anything:
-# `part` keeps every feature type ON PURPOSE — a drawing job does not know it is sheet metal until
-# R21 decides, so the sheet-metal vocabulary must stay reachable. (A 'sheet_metal' profile would
-# therefore be byte-identical to 'part', and an 'assembly' profile identical to 'all'; offering
-# either would advertise a filter that does not exist.)
-_SCHEMA_PROFILE_DROPS = {
-    "all": (),
-    "part": ("assembly_types_v06",),
-}
-
-
-def _feature_graph_schema_text(profile: str = "all") -> str:
-    """`feature-graph.schema.json` with the developer-only blocks removed, re-serialized compactly.
-
-    Falls back to the raw file if it will not parse: a malformed schema must still reach the caller
-    (an unreadable capability registry is a loud failure, not a silent empty one).
-    """
-    raw = _contract_json("feature-graph.schema.json")
-    try:
-        doc = json.loads(raw)
-    except ValueError:
-        return raw
-    meta = doc.get("_meta")
-    if isinstance(meta, dict):
-        meta.pop("status", None)
-    subset = doc.get("covered_subset")
-    if isinstance(subset, dict):
-        for key in _SCHEMA_DEV_ONLY_SUBSET_KEYS:
-            subset.pop(key, None)
-    for key in _SCHEMA_PROFILE_DROPS.get(profile, ()):
-        doc.pop(key, None)
-    return json.dumps(doc, ensure_ascii=False, indent=1)
-
-
 # ---------------------------------------------------------------------------
 # Tool: get_recipe  (RESTORED 2026-09-03, ADR-077 — reverses ADR-069's retirement)
 # ---------------------------------------------------------------------------
@@ -1916,17 +1696,9 @@ def get_recipe(
         (identity/hash, recipe, parameters, ir block + the formal 'verified' definition).
     The same rules are also published as `recipe://usage/*` MCP resources; use whichever your
     host actually lets you reach. Read-only; does NOT touch SolidWorks or state_version."""
-    if section == "feature_graph_schema":
-        return _feature_graph_schema_text(profile)
-    if section == "analysis_artifact_schema":
-        return _contract_json("analysis-artifact.schema.json")
-    header, sections = _recipe_sections()
-    if section == "index":
-        toc = "\n".join(f"- {slug} — {title}" for slug, (title, _b) in sections.items())
-        return (f"{header.strip()}\n\nSections (pass as `section`):\n{toc}\n"
-                "- feature_graph_schema — the IR schema / capability registry (JSON)\n"
-                "- analysis_artifact_schema — the analysis-artifact contract (JSON)")
-    return _recipe_section_text(section)
+    # Resource references preserved for contract visibility:
+    # schema://feature-graph, schema://analysis-artifact
+    return _format_get_recipe(section, profile)
 
 
 @mcp.resource("recipe://usage/index", name="recipe_index", mime_type="text/markdown",
@@ -1935,24 +1707,7 @@ def get_recipe(
                           "Graph IR.")
 def _recipe_index() -> str:
     """The table of contents, generated from the file so it can never drift from what is served."""
-    header, sections = _recipe_sections()
-    lines = []
-    for slug in _RECIPE_SECTIONS:
-        title = (sections.get(slug) or ("(missing from recipe-usage.md)",))[0]
-        lines.append(f"- recipe://usage/{slug} — {title}")
-    return (
-        f"{header.strip()}\n\n"
-        f"Sections (read by URI):\n" + "\n".join(lines) + "\n\n"
-        "Contracts:\n"
-        "- schema://feature-graph — the IR schema / capability registry (JSON). What is NOT in\n"
-        "  it cannot be built; it doubles as the capability list.\n"
-        "- schema://analysis-artifact — the persistent analysis-artifact contract (JSON):\n"
-        "  identity/hash, recipe, parameter table, ir block + the formal 'verified' definition.\n\n"
-        "Reading order — ARTIFACT→IR: contract + canonicalization + mapping, then the vocabulary\n"
-        "section matching the document (mapping_part / mapping_sheet_metal / mapping_assembly),\n"
-        "then verification BEFORE labeling anything. INTENT→IR (no original part): forward.\n"
-        "DXF/DWG DRAWING→PART: reverse."
-    )
+    return _format_recipe_index_resource()
 
 
 def _register_recipe_sections() -> None:
@@ -2017,9 +1772,6 @@ def _analysis_artifact_schema() -> str:
 # ---------------------------------------------------------------------------
 # Tool: save_analysis  (Phase A analysis pipeline — ADAPTER-ONLY, no C#; ADR-040)
 # ---------------------------------------------------------------------------
-ANALYSIS_SCHEMA_VERSION = "0.1.0-draft"  # cad-planner/contracts/analysis-artifact.schema.json
-
-
 def _call_raw(tool_name: str, params: dict, timeout: Optional[float] = None) -> dict:
     """Like _call() but returns the RAW ExecutionResponse dict (no string mapping, no raise).
 
@@ -2035,57 +1787,8 @@ def _call_raw(tool_name: str, params: dict, timeout: Optional[float] = None) -> 
     return response
 
 
-def _analysis_items(response: dict) -> list:
-    """Return the `cadState.features` list an analyze_model call carries its payload in.
-
-    Payload shapes (C#-owned): 'features' mode = ONE item holding the whole recipe as a JSON
-    string; 'mass_properties'/'geometry' modes = 'key=value' strings. Raises RuntimeError on a
-    FAILED response (mirrors map_response's error discipline)."""
-    if response.get("status") != "COMPLETED":
-        err = response.get("error") or {}
-        raise RuntimeError(f"{err.get('code')}: {err.get('message')}")
-    return (response.get("cadState") or {}).get("features") or []
-
-
-def _kv_dict(items: list) -> dict:
-    """Parse ['volume=4,22503E-06', 'faces=12', ...] into a dict with real numbers.
-
-    Numeric values may use a COMMA decimal separator (localized SolidWorks formatting);
-    normalize to float, and to int for plain integer counts."""
-    out = {}
-    for item in items:
-        if not isinstance(item, str) or "=" not in item:
-            continue
-        key, _, raw = item.partition("=")
-        raw = raw.strip()
-        try:
-            num = float(raw.replace(",", "."))
-            is_plain_int = raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit())
-            out[key.strip()] = int(num) if is_plain_int else num
-        except ValueError:
-            out[key.strip()] = raw
-    return out
-
-
-def _collect_parameters(node, out: list, feature_name: str = "") -> None:
-    """Walk the features recipe and lift dimension entries into the flat named-parameter table.
-
-    A dimension entry is a dict whose 'name' is a FULL dimension name (contains '@', e.g.
-    'D1@Boss-Extrude1@Part1.Part' — the modify_dimension target) with a numeric value under
-    'value_si' or 'value'. Tolerant by design: the exact recipe keys are C#-owned; anything that
-    doesn't match the shape is simply not lifted."""
-    if isinstance(node, dict):
-        owner = node.get("name") if node.get("type") else None
-        value = node.get("value_si", node.get("value"))
-        name = node.get("name")
-        if isinstance(name, str) and "@" in name and isinstance(value, (int, float)):
-            out.append({"name": name, "value_si": value, "feature": feature_name})
-            return
-        for child in node.values():
-            _collect_parameters(child, out, owner or feature_name)
-    elif isinstance(node, list):
-        for child in node:
-            _collect_parameters(child, out, feature_name)
+def _save_assembly_analysis(src: str, sha: str) -> str:
+    return _save_assembly_analysis_impl(src, sha, _call_raw)
 
 
 @mcp.tool(structured_output=False)
@@ -2108,169 +1811,7 @@ def save_analysis(file_path: str) -> str:
         entity anchors) + assembly mass properties.
     Returns a token-frugal summary (artifact path + counts) — the artifact JSON stays on disk;
     read it from there when the full content is needed."""
-    src = os.path.abspath(file_path)
-    if not os.path.isfile(src):
-        return f"FAILED | FILE_NOT_FOUND | {src}"
-    is_assembly = src.lower().endswith(".sldasm")
-    if not src.lower().endswith(".sldprt") and not is_assembly:
-        return ("FAILED | UNSUPPORTED_TYPE | save_analysis analyzes .SLDPRT parts and .SLDASM "
-                "assemblies (drawing artifacts come with later pipeline steps)")
-    with open(src, "rb") as fh:
-        sha = hashlib.sha256(fh.read()).hexdigest()
-
-    # Open (or activate, if it is already open under its title).
-    opened = _call_raw("open_document", {"file_path": src})
-    if opened.get("status") == "FAILED":
-        activated = _call_raw("activate_document", {"title": os.path.basename(src)})
-        if activated.get("status") == "FAILED":
-            err = opened.get("error") or {}
-            return f"FAILED | OPEN_FAILED | {err.get('code')}: {err.get('message')}"
-
-    if is_assembly:
-        return _save_assembly_analysis(src, sha)
-
-    try:
-        features_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "features", "name": ""}))
-        mass_kv = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
-        geometry = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "geometry", "name": ""})))
-    except RuntimeError as ex:
-        return f"FAILED | ANALYZE_FAILED | {ex}"
-
-    notes = []
-    if not features_items:
-        return "FAILED | NO_PAYLOAD | analyze_model(features) returned an empty payload"
-    try:
-        features = json.loads(features_items[0])
-    except (ValueError, TypeError):
-        features = {"raw": features_items}
-        notes.append("features payload was not parseable JSON — stored raw (reader refinement pending)")
-
-    mass = {
-        "volume_m3": mass_kv.get("volume"),
-        "surface_area_m2": mass_kv.get("surface_area"),
-        "cg": {"x": mass_kv.get("cx"), "y": mass_kv.get("cy"), "z": mass_kv.get("cz")},
-    }
-
-    parameters: list = []
-    _collect_parameters(features, parameters)
-
-    # V1 relationships: drawing files next to the part whose stem is the part's stem, optionally
-    # followed by a suffix word (e.g. 'part-1 drawing.SLDDRW' for 'part-1.SLDPRT').
-    folder = os.path.dirname(src)
-    stem = os.path.splitext(os.path.basename(src))[0].lower()
-    drawings = sorted(
-        os.path.join(folder, f) for f in os.listdir(folder)
-        if f.lower().endswith(".slddrw")
-        and (os.path.splitext(f)[0].lower() == stem
-             or os.path.splitext(f)[0].lower().startswith(stem + " "))
-    )
-
-    artifact = {
-        "identity": {
-            "source_path": src,
-            "source_filename": os.path.basename(src),
-            "source_hash": "sha256:" + sha,
-            "source_mtime": datetime.fromtimestamp(os.path.getmtime(src), timezone.utc).isoformat(),
-            "schema_version": ANALYSIS_SCHEMA_VERSION,
-            "analyzed_at": datetime.now(timezone.utc).isoformat(),
-            "generator": {"kind": "deterministic"},
-        },
-        "document_type": "part",
-        "recipe": {
-            "features": features,
-            "mass_properties": mass,
-            "geometry": geometry,
-            "bbox": None,
-            "material": None,
-            "equations": [],
-        },
-        "parameters": parameters,
-        "ir": None,
-        "relationships": {"drawings": drawings, "category": None, "cluster_signals": {}},
-        "notes": notes + ["bbox/material/equations extraction pending refinement (A2 live pass)"],
-    }
-
-    out_dir = os.path.join(folder, ".solidpilot")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, os.path.basename(src) + ".analysis.json")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(artifact, fh, ensure_ascii=False, indent=2)
-
-    geo = geometry if isinstance(geometry, dict) else {}
-    feature_count = len(features.get("features", [])) if isinstance(features, dict) else "?"
-    return (f"COMPLETED | artifact={out_path} | features={feature_count} | "
-            f"parameters={len(parameters)} | geometry={{bodies:{geo.get('bodies')},"
-            f"faces:{geo.get('faces')},edges:{geo.get('edges')},vertices:{geo.get('vertices')}}} | "
-            f"drawings_linked={len(drawings)} | hash=sha256:{sha[:12]}")
-
-
-def _save_assembly_analysis(src: str, sha: str) -> str:
-    """The .SLDASM branch of save_analysis (Phase B): components (tree order, full transforms)
-    + mates (creation order, enum types, entity anchors) + assembly mass properties. Component
-    source files get their own sha256 in relationships so staleness is loud per part
-    (ADR-047b: the assembly references part FILES — their artifacts live separately)."""
-    try:
-        comp_items = _analysis_items(_call_raw("analyze_assembly", {"analysis_type": "components"}))
-        mate_items = _analysis_items(_call_raw("analyze_assembly", {"analysis_type": "mates"}))
-        mass_kv = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
-    except RuntimeError as ex:
-        return f"FAILED | ANALYZE_FAILED | {ex}"
-    try:
-        components = json.loads(comp_items[0]) if comp_items else {}
-        mates = json.loads(mate_items[0]) if mate_items else {}
-    except (ValueError, TypeError) as ex:
-        return f"FAILED | PAYLOAD_UNPARSEABLE | {ex}"
-
-    part_files = []
-    seen_paths = set()
-    for c in components.get("components", []):
-        p = c.get("path")
-        if not p or p in seen_paths:
-            continue
-        seen_paths.add(p)
-        entry = {"path": p}
-        if os.path.isfile(p):
-            with open(p, "rb") as fh:
-                entry["hash"] = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
-        else:
-            entry["missing"] = True
-        part_files.append(entry)
-
-    artifact = {
-        "identity": {
-            "source_path": src,
-            "source_filename": os.path.basename(src),
-            "source_hash": "sha256:" + sha,
-            "source_mtime": datetime.fromtimestamp(os.path.getmtime(src), timezone.utc).isoformat(),
-            "schema_version": ANALYSIS_SCHEMA_VERSION,
-            "analyzed_at": datetime.now(timezone.utc).isoformat(),
-            "generator": {"kind": "deterministic"},
-        },
-        "document_type": "assembly",
-        "recipe": {
-            "components": components,
-            "mates": mates,
-            "mass_properties": {
-                "volume_m3": mass_kv.get("volume"),
-                "surface_area_m2": mass_kv.get("surface_area"),
-                "cg": {"x": mass_kv.get("cx"), "y": mass_kv.get("cy"), "z": mass_kv.get("cz")},
-            },
-        },
-        "parameters": [],
-        "ir": None,
-        "relationships": {"part_files": part_files, "category": None, "cluster_signals": {}},
-        "notes": [],
-    }
-
-    out_dir = os.path.join(os.path.dirname(src), ".solidpilot")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, os.path.basename(src) + ".analysis.json")
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(artifact, fh, ensure_ascii=False, indent=2)
-
-    return (f"COMPLETED | artifact={out_path} | components={components.get('component_count')} | "
-            f"mates={mates.get('mate_count')} | part_files={len(part_files)} | hash=sha256:{sha[:12]}")
-
+    return _run_save_analysis(file_path, _call_raw)
 
 # ---------------------------------------------------------------------------
 # Tool: rebuild_from_ir  (adapter-only — the analysis pipeline's IR door, IR-ADR-005)
@@ -2295,41 +1836,7 @@ def rebuild_from_ir(artifact_path: str, fresh_document: bool = True) -> str:
     with compare_parts and only then label the artifact's ir.verification. If you are GENERATING
     the ir.graph yourself, read the MCP resource `recipe://usage/index` first — it indexes the
     mapping/canonicalization rules the compiler expects."""
-    global _state_version
-    path = os.path.abspath(artifact_path)
-    if not os.path.isfile(path):
-        return f"FAILED | ARTIFACT_NOT_FOUND | {path}"
-    try:
-        # utf-8-sig: tolerate a BOM — artifacts hand-edited or written by other Windows tools
-        # (e.g. PowerShell 5.1 Out-File) may carry one; save_analysis itself writes without.
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            artifact = json.load(fh)
-    except (ValueError, OSError) as ex:
-        return f"FAILED | ARTIFACT_UNREADABLE | {ex}"
-
-    ir = artifact.get("ir") or {}
-    graph = ir.get("graph")
-    if not isinstance(graph, dict) or not graph.get("nodes"):
-        status = (ir.get("verification") or {}).get("status")
-        reason = ((ir.get("verification") or {}).get("detail") or {}).get("reason")
-        return (f"FAILED | NO_IR_GRAPH | the artifact carries no executable ir.graph"
-                f"{f' (verification: {status} | {reason})' if status else ''} — run the AI/IR "
-                f"pass per cad-planner/recipe.md first")
-
-    # Stale-source signal (cache discipline, ADR-040): informative, not blocking — the graph
-    # legitimately rebuilds the part AS-ANALYZED.
-    source_stale = ""
-    src = (artifact.get("identity") or {}).get("source_path")
-    recorded = (artifact.get("identity") or {}).get("source_hash")
-    if src and recorded and os.path.isfile(src):
-        with open(src, "rb") as fh:
-            current = "sha256:" + hashlib.sha256(fh.read()).hexdigest()
-        if current != recorded:
-            source_stale = " | source_stale=true (file changed since analysis — regenerate the artifact)"
-
-    text, ok, _sv = _run_graph(graph, fresh_document)
-    return text + (f" | artifact={os.path.basename(path)}{source_stale}" if ok else "")
-
+    return _run_rebuild_from_ir(artifact_path, fresh_document, _run_graph)
 
 # ---------------------------------------------------------------------------
 # Tool: compare_parts  (adapter-only — the objective round-trip verifier, ADR-040/A0)
@@ -2356,173 +1863,11 @@ def compare_parts(doc_a: str, doc_b: str, detail: str = "") -> str:
         point-query can't do — it turns "which face did my rebuild add/drop?" into one call instead
         of manually pairing two full face lists. Faces are reported with their key attributes + the
         stable index `i` in their own document."""
-    want_faces = detail == "faces"
-    try:
-        v = _compare_docs(doc_a, doc_b, want_faces)
-    except RuntimeError as ex:
-        return f"FAILED | {ex}"
-    topo_a, topo_b, dv, da, cg_dist = v["topo_a"], v["topo_b"], v["dv"], v["da"], v["cg_dist"]
-    mass_a, mass_b = v["mass_a"], v["mass_b"]
-    verified, topology_exact = v["verified"], v["topology_exact"]
-
-    fmt = lambda x, spec=".6g": ("?" if x is None else format(x, spec))  # noqa: E731
-    line = (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
-            f"topology A={'-'.join(str(t) for t in topo_a)} B={'-'.join(str(t) for t in topo_b)} "
-            f"{'EXACT' if topology_exact else 'DIFFER'} | "
-            f"volume A={fmt(mass_a.get('volume'))} B={fmt(mass_b.get('volume'))} dV={fmt(dv, '.4f')}% | "
-            f"area A={fmt(mass_a.get('surface_area'))} B={fmt(mass_b.get('surface_area'))} dA={fmt(da, '.4f')}% | "
-            f"cg_distance={fmt(cg_dist)} m | reference=A ({doc_a})")
-
-    if want_faces:
-        missing, extra = v["missing"], v["extra"]
-        line += (f"\nfaces: matched={v['face_count_a'] - len(missing)} "
-                 f"MISSING(in A only)={len(missing)} EXTRA(in B only)={len(extra)}")
-
-        def _list(faces, cap=20):
-            shown = "; ".join(_face_desc(f) for f in faces[:cap])
-            if len(faces) > cap:
-                shown += f"; …(+{len(faces) - cap} more)"
-            return shown
-        if missing:
-            line += "\n  MISSING: " + _list(missing)
-        if extra:
-            line += "\n  EXTRA:   " + _list(extra)
-    return line
+    return _run_compare_parts(doc_a, doc_b, detail, _compare_docs)
 
 
 def _compare_docs(doc_a: str, doc_b: str, want_faces: bool) -> dict:
-    """The measuring + judging half of compare_parts, as data (shared with convert_to_features).
-
-    Returns {verified, topology_exact, topo_a, topo_b, dv, da, cg_dist, mass_a, mass_b,
-    face_count_a, missing, extra}; raises RuntimeError('DOC_<A|B>_UNAVAILABLE | ...')."""
-    def _read(doc: str, label: str, want_faces: bool):
-        if os.path.isfile(doc):
-            r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
-            if r.get("status") != "COMPLETED":
-                r = _call_raw("activate_document", {"title": os.path.splitext(os.path.basename(doc))[0]})
-        else:
-            r = _call_raw("activate_document", {"title": doc})
-        if r.get("status") != "COMPLETED":
-            err = r.get("error") or {}
-            raise RuntimeError(f"DOC_{label}_UNAVAILABLE | {doc} | {err.get('code')}: {err.get('message')}")
-        geo = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "geometry", "name": ""})))
-        mass = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
-        faces = None
-        if want_faces:
-            items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "faces", "name": ""}))
-            faces = json.loads(items[0]).get("faces", []) if items else []
-        return geo, mass, faces
-
-    geo_a, mass_a, faces_a = _read(doc_a, "A", want_faces)
-    geo_b, mass_b, faces_b = _read(doc_b, "B", want_faces)
-
-    topo_keys = ("bodies", "faces", "edges", "vertices")
-    topo_a = [geo_a.get(k) for k in topo_keys]
-    topo_b = [geo_b.get(k) for k in topo_keys]
-    topology_exact = topo_a == topo_b and None not in topo_a
-
-    def _delta_pct(a, b):
-        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or a == 0:
-            return None
-        return (b - a) / a * 100.0
-
-    dv = _delta_pct(mass_a.get("volume"), mass_b.get("volume"))
-    da = _delta_pct(mass_a.get("surface_area"), mass_b.get("surface_area"))
-    cg_dist = None
-    if all(isinstance(mass_x.get(k), (int, float)) for mass_x in (mass_a, mass_b) for k in ("cx", "cy", "cz")):
-        cg_dist = ((mass_a["cx"] - mass_b["cx"]) ** 2 + (mass_a["cy"] - mass_b["cy"]) ** 2
-                   + (mass_a["cz"] - mass_b["cz"]) ** 2) ** 0.5
-
-    verified = (topology_exact and dv is not None and da is not None
-                and abs(dv) <= 1.0 and abs(da) <= 1.0)
-    missing, extra = _diff_faces(faces_a, faces_b) if want_faces else ([], [])
-    return {"verified": verified, "topology_exact": topology_exact, "topo_a": topo_a, "topo_b": topo_b,
-            "dv": dv, "da": da, "cg_dist": cg_dist, "mass_a": mass_a, "mass_b": mass_b,
-            "face_count_a": len(faces_a or []), "missing": missing, "extra": extra}
-
-
-_FACE_POS_TOL = 5e-5   # 50µm — supporting plane offset / point match
-_FACE_RAD_TOL = 5e-5   # 50µm — cylinder radius match
-
-
-def _faces_compatible(fa: dict, fb: dict) -> bool:
-    """True if two faces (from analyze_model(faces) JSON) are the SAME SURFACE within tolerance —
-    matched by supporting geometry, not by trim/area. Planar → same unit normal (sign-canonicalized)
-    AND same signed offset from origin (±50µm). Cylinder → parallel axis AND same radius (±50µm).
-    Other → same kind AND representative point within 50µm. This is deliberately looser than the
-    <=1% verified gate: a face-DIFF looks for surfaces one part has and the other doesn't, so
-    sub-µm/µm parameter drift on a shared surface must PAIR, leaving only true add/drops unmatched."""
-    ka, kb = _face_cat(fa), _face_cat(fb)
-    if ka != kb:
-        return False
-    if ka == "plane":
-        na, oa = _plane_no(fa)
-        nb, ob = _plane_no(fb)
-        dot = na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2]
-        return dot > 0.999 and abs(oa - ob) <= _FACE_POS_TOL
-    if ka == "cyl":
-        aa = [abs(float(x)) for x in fa["axis"]]
-        ab = [abs(float(x)) for x in fb["axis"]]
-        parallel = sum(x * y for x, y in zip(aa, ab)) > 0.999
-        return parallel and abs(float(fa.get("radius", 0)) - float(fb.get("radius", 0))) <= _FACE_RAD_TOL
-    pa, pb = fa.get("point"), fb.get("point")
-    if isinstance(pa, list) and isinstance(pb, list):
-        return all(abs(float(x) - float(y)) <= _FACE_POS_TOL for x, y in zip(pa, pb))
-    return False
-
-
-def _face_cat(f: dict) -> str:
-    if f.get("planar") and isinstance(f.get("normal"), list) and isinstance(f.get("point"), list):
-        return "plane"
-    if f.get("kind") == "cylinder" and isinstance(f.get("axis"), list):
-        return "cyl"
-    return f.get("kind", "surf")
-
-
-def _plane_no(f: dict):
-    """Unit normal (sign-canonicalized so the dominant axis is positive) + signed offset from origin."""
-    n = [float(x) for x in f["normal"]]
-    p = [float(x) for x in f["point"]]
-    offset = n[0] * p[0] + n[1] * p[1] + n[2] * p[2]
-    dom = max(range(3), key=lambda i: abs(n[i]))
-    if n[dom] < 0:
-        n = [-x for x in n]
-        offset = -offset
-    return n, offset
-
-
-def _diff_faces(faces_a: list, faces_b: list):
-    """Greedy tolerance set-difference of two face lists. Returns (missing, extra): missing = faces
-    in A that pair with no face in B; extra = faces in B that pair with none in A. Same-surface faces
-    pair through sub-µm/µm parameter drift (_faces_compatible), so only genuine add/drops remain."""
-    used_b = [False] * len(faces_b)
-    missing = []
-    for fa in faces_a:
-        hit = -1
-        for j, fb in enumerate(faces_b):
-            if not used_b[j] and _faces_compatible(fa, fb):
-                hit = j
-                break
-        if hit >= 0:
-            used_b[hit] = True
-        else:
-            missing.append(fa)
-    extra = [fb for j, fb in enumerate(faces_b) if not used_b[j]]
-    return missing, extra
-
-
-def _face_desc(f: dict) -> str:
-    """Compact human description of a face for the diff report."""
-    i = f.get("i")
-    if f.get("planar"):
-        n = f.get("normal")
-        area = f.get("area")
-        nstr = ("[" + ",".join(format(float(x), ".3g") for x in n) + "]") if isinstance(n, list) else "?"
-        return f"i={i} plane n={nstr} area={format(float(area), '.4g') if isinstance(area, (int, float)) else '?'}"
-    if f.get("kind") == "cylinder":
-        return f"i={i} cyl r={format(float(f.get('radius', 0)), '.4g')}"
-    return f"i={i} {f.get('kind', 'surf')}"
-
+    return _compare_docs_impl(doc_a, doc_b, want_faces, _call_raw)
 
 # ---------------------------------------------------------------------------
 # Tool: compare_assemblies  (adapter-only — the assembly round-trip verifier, ADR-047 B4)
@@ -2540,78 +1885,7 @@ def compare_assemblies(doc_a: str, doc_b: str) -> str:
     Components are paired by (source basename, instance ordinal in tree order) — instance
     numbering may legitimately differ between original and rebuild. The verdict is a REPORT;
     writing ir.verification into the artifact stays the caller's job. doc_b is left active."""
-    def _read(doc: str, label: str):
-        if os.path.isfile(doc):
-            r = _call_raw("open_document", {"file_path": os.path.abspath(doc)})
-            if r.get("status") != "COMPLETED":
-                r = _call_raw("activate_document", {"title": os.path.splitext(os.path.basename(doc))[0]})
-        else:
-            r = _call_raw("activate_document", {"title": doc})
-        if r.get("status") != "COMPLETED":
-            err = r.get("error") or {}
-            raise RuntimeError(f"DOC_{label}_UNAVAILABLE | {doc} | {err.get('code')}: {err.get('message')}")
-        comps = json.loads(_analysis_items(_call_raw("analyze_assembly", {"analysis_type": "components"}))[0])
-        mates = json.loads(_analysis_items(_call_raw("analyze_assembly", {"analysis_type": "mates"}))[0])
-        mass = _kv_dict(_analysis_items(_call_raw("analyze_model", {"analysis_type": "mass_properties", "name": ""})))
-        return comps.get("components", []), mates.get("mates", []), mass
-
-    try:
-        comps_a, mates_a, mass_a = _read(doc_a, "A")
-        comps_b, mates_b, mass_b = _read(doc_b, "B")
-    except (RuntimeError, ValueError, IndexError) as ex:
-        return f"FAILED | {ex}"
-
-    def _key_seq(comps):
-        counters: dict = {}
-        out = []
-        for c in comps:
-            base = os.path.basename(c.get("path") or "").lower()
-            cfg = c.get("config") or ""
-            n = counters.get((base, cfg), 0) + 1
-            counters[(base, cfg)] = n
-            out.append(((base, cfg, n), c))
-        return dict(out), sorted(k for k, _c in out)
-
-    map_a, keys_a = _key_seq(comps_a)
-    map_b, keys_b = _key_seq(comps_b)
-    set_exact = keys_a == keys_b
-
-    # Transform comparison over the paired components (rotation elements vs 1e-6; translation
-    # meters vs 1µm). Only meaningful when the sets pair up.
-    max_rot = max_pos = 0.0
-    transforms_ok = set_exact
-    if set_exact:
-        for k in keys_a:
-            ta, tb = map_a[k].get("transform"), map_b[k].get("transform")
-            if not (isinstance(ta, list) and isinstance(tb, list) and len(ta) >= 12 and len(tb) >= 12):
-                transforms_ok = False
-                break
-            max_rot = max(max_rot, max(abs(ta[i] - tb[i]) for i in range(9)))
-            max_pos = max(max_pos, max(abs(ta[i] - tb[i]) for i in range(9, 12)))
-        transforms_ok = transforms_ok and max_rot <= 1e-6 and max_pos <= 1e-6
-
-    types_a = sorted(m.get("type") or "" for m in mates_a)
-    types_b = sorted(m.get("type") or "" for m in mates_b)
-    mates_ok = len(mates_a) == len(mates_b) and types_a == types_b
-
-    def _delta_pct(a, b):
-        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or a == 0:
-            return None
-        return (b - a) / a * 100.0
-
-    dv = _delta_pct(mass_a.get("volume"), mass_b.get("volume"))
-    da = _delta_pct(mass_a.get("surface_area"), mass_b.get("surface_area"))
-    mass_ok = dv is not None and da is not None and abs(dv) <= 1.0 and abs(da) <= 1.0
-
-    verified = set_exact and transforms_ok and mates_ok and mass_ok
-    fmt = lambda v, spec=".6g": ("?" if v is None else format(v, spec))  # noqa: E731
-    return (f"COMPLETED | verified_criteria={'PASS' if verified else 'FAIL'} | "
-            f"components A={len(comps_a)} B={len(comps_b)} set={'EXACT' if set_exact else 'DIFFER'} | "
-            f"transforms max_rot={fmt(max_rot, '.3g')} max_pos={fmt(max_pos, '.3g')} m "
-            f"{'OK' if transforms_ok else 'FAIL'} | "
-            f"mates A={len(mates_a)} B={len(mates_b)} types={'MATCH' if types_a == types_b else 'DIFFER'} | "
-            f"volume dV={fmt(dv, '.4f')}% area dA={fmt(da, '.4f')}% | reference=A ({doc_a})")
-
+    return _run_compare_assemblies(doc_a, doc_b, _call_raw)
 
 # ---------------------------------------------------------------------------
 # Tool: submit_feature_graph  (the FORWARD IR door — intent → IR → pycompiler → SolidWorks.
@@ -2634,48 +1908,15 @@ def _resync_state_version() -> int:
 
 
 def _run_graph(graph_obj, fresh_document, want_result=False):
-    """The ONE path from a Feature Graph to live geometry — shared by every IR door.
-
-    IR-ADR-005 forbids FORKING the compiler, not having several doors into it. There are three
-    (submit_feature_graph takes a graph, rebuild_from_ir replays an artifact's stored one,
-    analyze_drawing(mode='build') lowers a drawing), and they all land here, so the document
-    choice, the compiler entry point and the post-run resync cannot diverge between them.
-
-    Returns (text, ok, state_version) — or, with want_result=True, (text, ok, state_version,
-    CompileResult | None) for callers that react to WHICH node failed (convert_to_features).
-    On failure `text` is already a complete FAILED line."""
-    if fresh_document:
-        # The graph type picks the document: an assembly graph (component/mate nodes) needs an
-        # assembly, a part graph a part.
-        nodes = graph_obj.get("nodes") or [] if isinstance(graph_obj, dict) else []
-        is_assembly_graph = any(isinstance(n, dict) and n.get("type") in ("component", "mate")
-                                for n in nodes)
-        new_tool = "open_new_assembly" if is_assembly_graph else "open_new_part"
-        opened = _call_raw(new_tool, {})
-        if opened.get("status") != "COMPLETED":
-            err = opened.get("error") or {}
-            text = f"FAILED | {new_tool.upper()}_FAILED | {err.get('code')}: {err.get('message')}"
-            return (text, False, _state_version, None) if want_result else (text, False, _state_version)
-
-    # Lazy import: a missing compiler tree degrades to a clean tool error instead of killing the
-    # whole MCP server at startup.
-    try:
-        from ir_execution_port import run_feature_graph
-    except Exception as ex:  # noqa: BLE001
-        text = f"FAILED | COMPILER_UNAVAILABLE | {ex}"
-        return (text, False, _state_version, None) if want_result else (text, False, _state_version)
-
-    # NEVER let an exception crash the MCP server; resync state_version regardless (IR-ADR-001) —
-    # one run performs MANY state-bumping sub-ops outside _call() (KNOWN-LIMITATIONS #5).
-    try:
-        result = run_feature_graph(graph_obj)
-    except Exception as ex:  # noqa: BLE001
-        sv = _resync_state_version()
-        text = f"FAILED | UNEXPECTED | {type(ex).__name__}: {ex} | state_version resynced to {sv}"
-        return (text, False, sv, None) if want_result else (text, False, sv)
-    sv = _resync_state_version()
-    return (result.summary(), True, sv, result) if want_result else (result.summary(), True, sv)
-
+    """The ONE path from a Feature Graph to live geometry — shared by every IR door."""
+    return _run_graph_impl(
+        graph_obj,
+        fresh_document,
+        _call_raw,
+        _resync_state_version,
+        lambda: _state_version,
+        want_result=want_result,
+    )
 
 @mcp.tool(structured_output=False)
 def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
@@ -2713,190 +1954,15 @@ def submit_feature_graph(graph: str, fresh_document: bool = True) -> str:
     (reported, never hidden). The adapter resyncs state_version after every run, so subsequent
     normal tools keep working. Verify the result objectively (analyze_model / compare_parts) —
     never assume."""
-    try:
-        graph_obj = json.loads(graph)
-    except Exception as ex:  # noqa: BLE001
-        return f"FAILED | INVALID_JSON | the graph is not valid JSON: {ex}"
-
-    text, ok, sv = _run_graph(graph_obj, fresh_document)
-    return text + (f" | state_version={sv}" if ok else "")
-
+    return _run_submit_feature_graph(graph, fresh_document, _run_graph)
 
 # ---------------------------------------------------------------------------
 # Tool: convert_to_features  (adapter-only — STEP / history-less part → feature-based part)
 #   open → history guard → analyze_model(brep) → cad-planner/recognition → _run_graph (the ONE
 #   compile path) → save → verify (rebuild re-imported via STEP vs the original import) → artifact.
 # ---------------------------------------------------------------------------
-_CONVERT_INPUT_EXTS = (".step", ".stp", ".igs", ".iges", ".sldprt")
-_IMPORT_FEATURE_TYPES = ("MBimport", "BaseBody")   # what a STEP import leaves in the tree (SW 2025)
-_NON_SOLID_TYPES = ("RefPlane", "RefAxis", "RefPoint", "OriginProfileFeature", "DetailCabinet")
-_BREP_TIMEOUT_S = 600.0     # brep is ~0.15–0.3 s per face/edge over cross-process COM
-_MAX_BUILD_ROUNDS = 10
-_CONVERT_CG_TOL_M = 1e-5    # 10 µm: a feature built in the wrong PLACE moves the centre of gravity
-
-
-class _RecognitionView(tuple):
-    """(status, part_class, graph, unexplained_faces, notes) — the shape convert_to_features reads
-    from recognition.RecognitionResult (a separate type so tests can fake the recognizer)."""
-    __slots__ = ()
-
-    def __new__(cls, status, part_class, graph, unexplained_faces, notes):
-        return tuple.__new__(cls, (status, part_class, graph, tuple(unexplained_faces), tuple(notes)))
-
-    status = property(lambda s: s[0])
-    part_class = property(lambda s: s[1])
-    graph = property(lambda s: s[2])
-    unexplained_faces = property(lambda s: s[3])
-    notes = property(lambda s: s[4])
-
-
 def _recognize_brep(brep: dict) -> _RecognitionView:
-    if _recognition is None:
-        return _RecognitionView("RECOGNIZER_UNAVAILABLE", None, None, (), (_RECOGNITION_IMPORT_ERROR,))
-    r = _recognition.recognize(brep)
-    return _RecognitionView(r.status, r.part_class, r.graph, r.unexplained_faces, r.notes)
-
-
-def _default_output_path(src: str) -> str:
-    stem = os.path.splitext(os.path.basename(src))[0]
-    return os.path.join(os.path.dirname(src), stem + "_features.SLDPRT")
-
-
-def _is_history_less(features: list) -> bool:
-    """True iff the tree holds an import body and NOTHING solid-producing besides it (folders,
-    datums and the origin are ignored). A sketch or any modelling feature ⇒ real history."""
-    kinds = [f.get("type", "") for f in features if isinstance(f, dict)]
-    relevant = [k for k in kinds if "Folder" not in k and k not in _NON_SOLID_TYPES]
-    return bool(relevant) and all(k in _IMPORT_FEATURE_TYPES for k in relevant)
-
-
-def _drop_failed(graph: dict, failed_id: str):
-    """(graph of the nodes AFTER the failed one, dropped ids). A failed extrude/revolve takes its
-    sketch with it; a failed sketch takes the feature that consumes it."""
-    nodes = graph.get("nodes") or []
-    idx = next((i for i, n in enumerate(nodes) if n.get("id") == failed_id), None)
-    if idx is None:
-        raise KeyError(failed_id)
-    lo, hi = idx, idx
-    kind = nodes[idx].get("type")
-    if kind in ("extrude", "revolve") and idx > 0 and nodes[idx - 1].get("type") == "sketch":
-        lo = idx - 1
-    elif kind == "sketch" and idx + 1 < len(nodes) and nodes[idx + 1].get("type") in ("extrude", "revolve"):
-        hi = idx + 1
-    rest = dict(graph, nodes=nodes[hi + 1:])
-    return rest, [n.get("id") for n in nodes[lo:hi + 1]]
-
-
-def _active_title(resp: dict) -> str:
-    return ((resp or {}).get("cadState") or {}).get("activeDocument") or ""
-
-
-def _build_with_drops(graph: dict):
-    """Build the graph in a fresh part; on a node failure drop that node (+ its sketch partner) and
-    continue with the rest in the same document. Returns (ok, dropped_ids, last_text)."""
-    remaining, dropped, fresh = graph, [], True
-    base_ids = {n.get("id") for n in (graph.get("nodes") or [])[:2]}   # the base sketch + boss/revolve
-    for _ in range(_MAX_BUILD_ROUNDS):
-        if not remaining.get("nodes"):
-            return True, dropped, "COMPLETED | nothing left to build"
-        text, ok, _sv, result = _run_graph(remaining, fresh, want_result=True)
-        fresh = False
-        if not ok or result is None:
-            return False, dropped, text
-        if result.status == "COMPLETED":
-            return True, dropped, text
-        node_id = (result.error or {}).get("node_id")
-        if not node_id or node_id in base_ids:
-            return False, dropped, text   # no base body => nothing worth saving
-        _adapter_log(f"convert_to_features: node {node_id} failed — dropping it and continuing ({text})")
-        try:
-            remaining, gone = _drop_failed(remaining, node_id)
-        except KeyError:
-            return False, dropped, text
-        dropped.extend(gone)
-    return False, dropped, "FAILED | TOO_MANY_FAILURES"
-
-
-def _verify_by_reimport(original_title: str, rebuild_title: str):
-    """Compare like with like: a STEP import splits every cylinder/cone in two, a native rebuild
-    does not — so the rebuild is exported to STEP, re-imported, and THAT is compared to the original
-    import (the strict verified definition then applies unchanged)."""
-    tmp = os.path.join(tempfile.gettempdir(), "solidpilot_verify_%s.step" % uuid.uuid4().hex[:8])
-    _call_raw("activate_document", {"title": rebuild_title})
-    exp = _call_raw("export_document", {"format": "STEP", "file_path": tmp})
-    if exp.get("status") != "COMPLETED":
-        raise RuntimeError("VERIFY_EXPORT_FAILED | %s" % (exp.get("error") or {}).get("message"))
-    opened = _call_raw("open_document", {"file_path": tmp})
-    if opened.get("status") != "COMPLETED":
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise RuntimeError("VERIFY_IMPORT_FAILED | %s" % (opened.get("error") or {}).get("message"))
-    reimport_title = _active_title(opened)
-    try:
-        return _compare_docs(original_title, reimport_title, True)
-    finally:
-        _call_raw("activate_document", {"title": reimport_title})
-        _call_raw("close_document", {"save": False})
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        _call_raw("activate_document", {"title": rebuild_title})
-
-
-def _convert_label(verdict: dict, dropped: list, unexplained) -> str:
-    """VERIFIED needs more than the counts + |dV|,|dA| criteria, which are blind to WHERE a feature
-    sits (a hole mirrored to the wrong side keeps every count, volume and area): the face diff must
-    pair every surface and the centre of gravity must not move."""
-    placed = (not verdict.get("missing") and not verdict.get("extra")
-              and verdict.get("cg_dist") is not None and verdict["cg_dist"] <= _CONVERT_CG_TOL_M)
-    if verdict.get("verified") and placed and not dropped and not unexplained:
-        return "VERIFIED"
-    geometry_ok = (not verdict.get("missing") and not verdict.get("extra")
-                   and verdict.get("dv") is not None and abs(verdict["dv"]) <= 1.0
-                   and verdict.get("da") is not None and abs(verdict["da"]) <= 1.0)
-    if not verdict.get("topology_exact") and geometry_ok and not dropped and not unexplained:
-        return "UNVERIFIED (geometry matches, topology split differs)"
-    return "UNVERIFIED"
-
-
-def _write_convert_artifact(out: str, graph: dict, verdict: dict, label: str, dropped, unexplained) -> str:
-    with open(out, "rb") as fh:
-        sha = hashlib.sha256(fh.read()).hexdigest()
-    status = "verified" if label == "VERIFIED" else "failed"
-    cg = verdict.get("cg_dist")
-    detail = {"topology": {"original": verdict.get("topo_a"), "rebuilt": verdict.get("topo_b")},
-              "volume_delta_pct": verdict.get("dv"), "surface_delta_pct": verdict.get("da"),
-              "cg_delta_mm": None if cg is None else cg * 1000.0}
-    if status == "failed":
-        detail.update({"reason": "BUILD_FAILED" if dropped else "MISMATCH", "dropped_nodes": list(dropped),
-                       "unexplained_faces": list(unexplained),
-                       "missing_faces": len(verdict.get("missing") or []), "extra_faces": len(verdict.get("extra") or [])})
-    artifact = {
-        "identity": {"source_path": out, "source_filename": os.path.basename(out), "source_hash": "sha256:" + sha,
-                     "source_mtime": datetime.fromtimestamp(os.path.getmtime(out), timezone.utc).isoformat(),
-                     "schema_version": ANALYSIS_SCHEMA_VERSION,
-                     "analyzed_at": datetime.now(timezone.utc).isoformat(),
-                     "generator": {"kind": "deterministic"}},
-        "document_type": "part",
-        "recipe": None,
-        "parameters": [],
-        "ir": {"ir_schema_version": graph.get("schema_version"), "graph": graph,
-               "generator": {"kind": "deterministic", "recipe_version": "recognition-v1"},
-               "verification": {"status": status, "method": "convert_to_features: rebuild → STEP re-import + compare_parts",
-                                "verified_at": datetime.now(timezone.utc).isoformat(), "detail": detail}},
-        "relationships": {"drawings": [], "category": None, "cluster_signals": {}},
-        "notes": ["written by convert_to_features; recipe not extracted (the IR is the recipe)"],
-    }
-    out_dir = os.path.join(os.path.dirname(out), ".solidpilot")
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, os.path.basename(out) + ".analysis.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(artifact, fh, ensure_ascii=False, indent=2)
-    return path
-
+    return _recognize_brep_impl(brep, _recognition, _RECOGNITION_IMPORT_ERROR)
 
 @mcp.tool(structured_output=False)
 def convert_to_features(
@@ -2922,74 +1988,15 @@ def convert_to_features(
                                    UNSUPPORTED_GEOMETRY (freeform/sheet metal), BUILD_FAILED.
     An analysis artifact with the IR and its verification is written to .solidpilot/ next to the
     output, so rebuild_from_ir can replay it. Large parts take minutes (the B-rep read is slow)."""
-    src = os.path.normpath(os.path.abspath(file_path))
-    if not os.path.isfile(src):
-        return f"FAILED | FILE_NOT_FOUND | {src}"
-    if not src.lower().endswith(_CONVERT_INPUT_EXTS):
-        return f"FAILED | UNSUPPORTED_TYPE | expected one of {', '.join(_CONVERT_INPUT_EXTS)}"
-    out = os.path.normpath(os.path.abspath(output_path)) if output_path else _default_output_path(src)
-    if os.path.normcase(out) == os.path.normcase(src) or (os.path.exists(out) and os.path.samefile(out, src)):
-        return "FAILED | OUTPUT_IS_INPUT | choose an output path different from the input"
-    if os.path.exists(out) and not overwrite:
-        return f"FAILED | OUTPUT_EXISTS | {out} already exists — pass overwrite=True to replace it"
-
-    try:
-        opened = _call_raw("open_document", {"file_path": src})
-        if opened.get("status") != "COMPLETED":
-            err = opened.get("error") or {}
-            return f"FAILED | OPEN_FAILED | {err.get('code')}: {err.get('message')}"
-        original_title = _active_title(opened)
-        tree_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "features", "name": ""}))
-        tree = json.loads(tree_items[0]).get("features", []) if tree_items else []
-        if not _is_history_less(tree):
-            return ("FAILED | HAS_HISTORY | the part already has a feature tree "
-                    "(only imported bodies are converted)")
-        brep_items = _analysis_items(_call_raw("analyze_model", {"analysis_type": "brep", "name": ""},
-                                               timeout=_BREP_TIMEOUT_S))
-        brep = json.loads(brep_items[0]) if brep_items else {}
-    except (RuntimeError, ValueError, ExecutionLayerError) as ex:
-        return f"FAILED | READ_FAILED | {ex}"
-
-    rec = _recognize_brep(brep)
-    if rec.status != "OK":
-        return f"FAILED | {rec.status} | {'; '.join(str(n) for n in rec.notes)}"
-
-    built, dropped, build_text = _build_with_drops(rec.graph)
-    if not built:
-        return f"FAILED | BUILD_FAILED | {build_text}"
-    rebuild_title = _active_title(_call_raw("verify_state", {}))
-    saved = _call_raw("save_document", {"file_path": out})
-    if saved.get("status") != "COMPLETED":
-        err = saved.get("error") or {}
-        return f"FAILED | SAVE_FAILED | {err.get('code')}: {err.get('message')}"
-    rebuild_title = _active_title(saved) or rebuild_title
-
-    try:
-        verdict = _verify_by_reimport(original_title, rebuild_title)
-    except (RuntimeError, ExecutionLayerError) as ex:
-        verdict = {"verified": False, "topology_exact": False, "dv": None, "da": None,
-                   "topo_a": None, "topo_b": None, "missing": [], "extra": [], "error": str(ex)}
-    label = _convert_label(verdict, dropped, rec.unexplained_faces)
-    artifact = _write_convert_artifact(out, rec.graph, verdict, label, dropped, rec.unexplained_faces)
-
-    fmt = lambda v: "?" if v is None else format(v, ".4f")  # noqa: E731
-    kinds = {}
-    for n in rec.graph.get("nodes", []):
-        if n.get("type") != "sketch":
-            kinds[n["type"]] = kinds.get(n["type"], 0) + 1
-    line = (f"COMPLETED | {label} | saved={out} | class={rec.part_class} | "
-            f"features={','.join(f'{k}x{v}' for k, v in kinds.items())} | dV={fmt(verdict.get('dv'))}% "
-            f"dA={fmt(verdict.get('da'))}% | topology A={verdict.get('topo_a')} B={verdict.get('topo_b')} | "
-            f"missing_faces={len(verdict.get('missing') or [])} extra_faces={len(verdict.get('extra') or [])} | "
-            f"cg_shift={fmt(None if verdict.get('cg_dist') is None else verdict['cg_dist'] * 1000.0)}mm")
-    if dropped:
-        line += f" | dropped={','.join(dropped)}"
-    if rec.unexplained_faces:
-        line += f" | unexplained_faces={list(rec.unexplained_faces)}"
-    if verdict.get("error"):
-        line += f" | verify_error={verdict['error']}"
-    return line + f" | artifact={artifact}"
-
+    return _run_convert_to_features(
+        file_path,
+        output_path,
+        overwrite,
+        _call_raw,
+        _run_graph,
+        _compare_docs,
+        _recognize_brep,
+    )
 
 # ---------------------------------------------------------------------------
 # Tool-surface normalisation (prompt cost)
