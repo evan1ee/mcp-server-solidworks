@@ -51,6 +51,7 @@ from ir_runner import (
     run_rebuild_from_ir as _run_rebuild_from_ir,
     run_submit_feature_graph as _run_submit_feature_graph,
 )
+from tools.lifecycle import register_lifecycle_tools
 from feature_conversion import (
     _RecognitionView,
     recognize_brep as _recognize_brep_impl,
@@ -134,83 +135,13 @@ def _call(tool_name: str, params: dict) -> str:
     return map_response(response)
 
 
-# ---------------------------------------------------------------------------
-# Tool: ensure_ready  (lifecycle / bootstrap — not a state-versioned CAD op)
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def ensure_ready() -> str:
-    """Bring the SolidWorks environment up and confirm it is ready to use.
-
-    Starts the execution server if it isn't running, and launches SolidWorks if it is closed
-    (just attaches if it's already open). Does NOT open or create any document — use
-    open_new_part / create_drawing for that (so assembly/drawing workflows aren't forced into a
-    part). Safe to call anytime; idempotent. Call this first at the start of a session, or
-    whenever a tool fails with a connection / COM-attach error."""
+def _set_state_version(sv: int) -> None:
     global _state_version
-    body = _ensure_ready()
-    if not body.get("comAttached"):
-        raise RuntimeError(
-            "SolidWorks is not ready | "
-            f"launch_error={body.get('launchError') or body.get('ensureError')}"
-        )
-    sv = body.get("stateVersion")
-    if sv is not None:
-        _state_version = sv
-    return (
-        f"READY | server=UP | "
-        f"com_attached={body.get('comAttached')} | "
-        f"sw_launched={body.get('swLaunched')} | "
-        f"active_document={body.get('activeDocument')} | "
-        f"sw_version={body.get('swVersion')} | "
-        f"state_version={body.get('stateVersion')}"
-    )
+    _state_version = sv
 
 
-# ---------------------------------------------------------------------------
-# Tool: open_new_part
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def open_new_part(template_path: str = "") -> str:
-    """Open a new SolidWorks part document."""
-    params = {}
-    if template_path:
-        params["template_path"] = template_path
-    return _call("open_new_part", params)
-
-
-# ---------------------------------------------------------------------------
-# Tool: open_document
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def open_document(file_path: str, as_assembly: bool = False) -> str:
-    """Open an EXISTING document from disk (counterpart to open_new_part, which makes a BLANK doc).
-    file_path: full path to the file.
-      - Native .sldprt / .sldasm / .slddrw open directly.
-      - Foreign .step / .iges / .x_t / NX .prt / .ipt / .CATPart import via a STAGED path: the
-        CLASSIC translator (LoadFile4) first — proven for STEP/IGES and NX .prt — with a
-        3D-Interconnect retry as the last resort. A clear OPEN_FAILED means no usable translator:
-        convert to STEP or defer that file.
-      - as_assembly=True (foreign files only): the file is an ASSEMBLY STEP — the classic import
-        would flatten it to a MULTIBODY PART; this asks for a real assembly import instead.
-    Makes the opened document active and bumps state_version."""
-    params = {"file_path": file_path}
-    if as_assembly:
-        params["as_assembly"] = True
-    return _call("open_document", params)
-
-
-# ---------------------------------------------------------------------------
-# Tool: open_new_assembly  (Phase B, ADR-047)
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def open_new_assembly(template_path: str = "") -> str:
-    """Open a new blank SolidWorks ASSEMBLY document (the twin of open_new_part).
-    Use before insert_component / add_mate. template_path: optional .asmdot template
-    (default: the user-configured assembly template)."""
-    params = {}
-    if template_path:
-        params["template_path"] = template_path
-    return _call("open_new_assembly", params)
+_lifecycle_tools = register_lifecycle_tools(mcp, _call, _ensure_ready, _set_state_version)
+globals().update(_lifecycle_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -307,20 +238,6 @@ def add_mate(
     if mate_type in ("distance", "angle"):
         params["value"] = value
     return _call("add_mate", params)
-
-
-# ---------------------------------------------------------------------------
-# Tool: save_body_as_part  (Phase B — flattened-assembly reconstruction, ADR-048)
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def save_body_as_part(body_index: int, file_path: str) -> str:
-    """Extract ONE solid body of the ACTIVE multibody part into its own .SLDPRT file.
-    body_index: from analyze_model(analysis_type='bodies'). The body's geometry stays in the
-    SOURCE coordinates (recover the instance transform separately); the new part is saved to
-    file_path and closed, and the source document is re-activated. Use for flattened assembly
-    imports whose per-part files don't exist: one file per DISTINCT body (fingerprint-deduped),
-    then instances reference it with recovered transforms."""
-    return _call("save_body_as_part", {"body_index": body_index, "file_path": file_path})
 
 
 # ---------------------------------------------------------------------------
@@ -966,43 +883,6 @@ def batch_export(file_path_base: str, formats_json: str) -> str:
     Each format is exported as file_path_base.<ext>. DWG/DXF skipped if active doc is not a drawing.
     Partial success is reported in the response Features list."""
     return _call("batch_export", {"file_path_base": file_path_base, "formats_json": formats_json})
-
-
-# ---------------------------------------------------------------------------
-# Tool: verify_state
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def verify_state() -> str:
-    """Read and return the current CAD state without modifying it."""
-    return _call("verify_state", {})
-
-
-# ---------------------------------------------------------------------------
-# Tool: close_document
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def close_document(save: bool = False, close_all: bool = False) -> str:
-    """Close the active SolidWorks document. Set save=True to save before closing.
-    close_all=True closes ALL open documents (incl. invisibly-loaded component docs that a
-    per-document close loop can never reach), DISCARDING unsaved changes — use to fully reset
-    the document space between assembly jobs."""
-    params = {"save": save}
-    if close_all:
-        params["close_all"] = True
-    return _call("close_document", params)
-
-
-# ---------------------------------------------------------------------------
-# Tool: save_document
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def save_document(file_path: str = "") -> str:
-    """Save the active SolidWorks document to disk.
-    file_path: full output path including the document extension
-    (.sldprt for parts, .sldasm for assemblies, .slddrw for drawings).
-    If omitted, saves in place (only works if the document was saved before).
-    A part must be saved to disk before it can be referenced by a drawing view."""
-    return _call("save_document", {"file_path": file_path})
 
 
 # ---------------------------------------------------------------------------
@@ -1682,18 +1562,6 @@ def edit_feature(
         "edit_feature",
         {"feature_name": feature_name, "action": action, "new_name": new_name},
     )
-
-
-# ---------------------------------------------------------------------------
-# Tool: activate_document
-# ---------------------------------------------------------------------------
-@mcp.tool(structured_output=False)
-def activate_document(title: str) -> str:
-    """Switch the ACTIVE SolidWorks document to an already-open one by its title (e.g. 'gear' or
-    'gear.SLDPRT'). Use this to read/compare another open part — e.g. activate the original, analyze_model
-    it, then activate your copy — without OS window switching. Does NOT change geometry or state_version.
-    The document must already be OPEN. Returns the now-active document title."""
-    return _call("activate_document", {"title": title})
 
 
 # ---------------------------------------------------------------------------
